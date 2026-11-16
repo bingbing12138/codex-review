@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""CLI helper to inspect and update hot-reloaded codex-reviewer settings."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+CONFIG_PATH = Path(
+    os.environ.get(
+        "CODEX_REVIEWER_CONFIG",
+        str(Path.home() / ".config" / "codex-reviewer" / "config.json"),
+    )
+)
+
+VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "model": "gpt-6.1-sol",
+    "reasoning_effort": "high",
+    "codex_bin": "codex",
+    "timeout_sec": 300,
+    "extra_codex_args": [],
+    "model_aliases": {
+        "gpt-sol 6.1": "gpt-6.1-sol",
+        "gpt-sol-6.1": "gpt-6.1-sol",
+        "sol-6.1": "gpt-6.1-sol",
+        "sol": "gpt-6.1-sol",
+        "gpt-astra": "gpt-6-astra",
+        "gpt-6-astra": "gpt-6-astra",
+        "astra": "gpt-6-astra",
+        "gpt-luna": "gpt-6-luna",
+        "luna": "gpt-6-luna",
+        "gpt-terra": "gpt-6.1-terra",
+        "terra": "gpt-6.1-terra",
+    },
+}
+
+
+def merge_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Merge user settings over defaults while retaining built-in aliases."""
+    merged = dict(DEFAULT_CONFIG)
+    aliases = dict(DEFAULT_CONFIG["model_aliases"])
+    if isinstance(raw.get("model_aliases"), dict):
+        for k, v in raw["model_aliases"].items():
+            if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
+                aliases[k.strip()] = v.strip()
+    for key in ("model", "reasoning_effort", "codex_bin", "timeout_sec", "extra_codex_args"):
+        if key in raw and raw[key] is not None:
+            merged[key] = raw[key]
+    merged["model_aliases"] = aliases
+    return merged
+
+
+def load_config() -> dict[str, Any]:
+    """Read current config from CONFIG_PATH or return defaults."""
+    if not CONFIG_PATH.exists():
+        return merge_config({})
+    data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    return merge_config(data if isinstance(data, dict) else {})
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    """Atomically write updated config to CONFIG_PATH."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=str(CONFIG_PATH.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+        os.replace(tmp_name, CONFIG_PATH)
+    except Exception:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise
+
+
+def resolve_model_and_effort(
+    raw_model: str | None,
+    raw_effort: str | None,
+    cfg: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Normalize informal model aliases and optional trailing effort token."""
+    resolved_effort = raw_effort.strip().lower() if raw_effort else None
+    resolved_model = None
+    if raw_model is not None:
+        text = raw_model.strip()
+        parts = text.split()
+        if resolved_effort is None and len(parts) >= 2 and parts[-1].lower() in VALID_EFFORTS:
+            resolved_effort = parts[-1].lower()
+            text = " ".join(parts[:-1])
+        key = re.sub(r"\s+", " ", text).strip().lower()
+        alias_map = {
+            re.sub(r"\s+", " ", k).strip().lower(): v
+            for k, v in cfg.get("model_aliases", {}).items()
+        }
+        resolved_model = alias_map.get(key, text)
+    if resolved_effort in ("none", "off", "default", "unset"):
+        resolved_effort = ""
+    return resolved_model, resolved_effort
+
+
+def resolve_codex_binary(codex_bin: str) -> str:
+    """Locate codex CLI across configured value, PATH, and standard locations."""
+    if codex_bin and os.sep in codex_bin and Path(codex_bin).exists():
+        return codex_bin
+    found = shutil.which(codex_bin or "codex") or shutil.which("codex")
+    if found:
+        return found
+    for candidate in (
+        Path("/opt/homebrew/bin/codex"),
+        Path("/usr/local/bin/codex"),
+        Path.home() / ".local" / "bin" / "codex",
+    ):
+        if candidate.exists():
+            return str(candidate)
+    return codex_bin or "codex"
+
+
+def detect_codex_version(codex_bin: str) -> str:
+    """Detect installed codex CLI version string."""
+    binary = resolve_codex_binary(codex_bin)
+    try:
+        proc = subprocess.run(
+            [binary, "--version"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return (proc.stdout or proc.stderr or "").strip() or f"exit {proc.returncode}"
+    except Exception as exc:  # noqa: BLE001
+        return f"unavailable ({exc})"
+
+
+def print_status(cfg: dict[str, Any]) -> None:
+    """Print active reviewer configuration and detected Codex CLI version."""
+    out = {
+        "config_path": str(CONFIG_PATH),
+        "codex_version": detect_codex_version(str(cfg.get("codex_bin") or "codex")),
+        "model": cfg.get("model"),
+        "reasoning_effort": cfg.get("reasoning_effort") or "model-default",
+        "codex_bin": cfg.get("codex_bin"),
+        "timeout_sec": cfg.get("timeout_sec"),
+        "extra_codex_args": cfg.get("extra_codex_args"),
+        "model_aliases": cfg.get("model_aliases"),
+    }
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="codex-review-config",
+        description="Inspect and hot-swap the model/settings used by the AGY codex-reviewer plugin.",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("status", help="Show active model, reasoning effort, and aliases.")
+    sub.add_parser("reset", help="Reset configuration to defaults (gpt-6.1-sol, high).")
+
+    set_p = sub.add_parser("set", help="Update model, reasoning effort, or Codex flags.")
+    set_p.add_argument("positional_model", nargs="?", help="Model slug or alias (e.g. gpt-6.1-sol, 'gpt-sol 6.1').")
+    set_p.add_argument("positional_effort", nargs="?", help="Reasoning effort (low|medium|high|xhigh|max|ultra|none).")
+    set_p.add_argument("--model", "-m", dest="flag_model", help="Model slug or alias.")
+    set_p.add_argument("--effort", "-e", dest="flag_effort", help="Reasoning effort.")
+    set_p.add_argument("--timeout", type=int, help="Subprocess timeout in seconds.")
+    set_p.add_argument("--codex-bin", help="Path to codex binary.")
+    set_p.add_argument("--add-arg", action="append", default=[], help="Append an extra CLI flag passed to codex.")
+    set_p.add_argument("--clear-args", action="store_true", help="Clear extra_codex_args.")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point for codex-review-config CLI."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cmd = args.command or "status"
+
+    if cmd == "status":
+        print_status(load_config())
+        return 0
+
+    if cmd == "reset":
+        cfg = merge_config({})
+        save_config(cfg)
+        print_status(cfg)
+        return 0
+
+    if cmd == "set":
+        cfg = load_config()
+        raw_model = args.flag_model if args.flag_model is not None else args.positional_model
+        raw_effort = args.flag_effort if args.flag_effort is not None else args.positional_effort
+        resolved_model, resolved_effort = resolve_model_and_effort(raw_model, raw_effort, cfg)
+
+        if resolved_model is not None:
+            cfg["model"] = resolved_model
+        if resolved_effort is not None:
+            cfg["reasoning_effort"] = resolved_effort
+        if args.timeout is not None:
+            if args.timeout <= 0:
+                print("Error: --timeout must be positive.", file=sys.stderr)
+                return 2
+            cfg["timeout_sec"] = args.timeout
+        if args.codex_bin is not None:
+            cfg["codex_bin"] = args.codex_bin.strip()
+        if args.clear_args:
+            cfg["extra_codex_args"] = []
+        if args.add_arg:
+            existing = list(cfg.get("extra_codex_args") or [])
+            existing.extend(args.add_arg)
+            cfg["extra_codex_args"] = existing
+
+        save_config(cfg)
+        print_status(cfg)
+        return 0
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

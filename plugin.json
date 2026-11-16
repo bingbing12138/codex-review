@@ -1,0 +1,6 @@
+{
+  "name": "codex-reviewer",
+  "version": "1.0.0",
+  "displayName": "Codex Reviewer",
+  "description": "Seamless read-only Codex second-opinion reviewer for scientific workflows, plans, and code."
+}

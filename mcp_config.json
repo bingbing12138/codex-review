@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "codex-reviewer": {
+      "command": "python3",
+      "args": [
+        "-c",
+        "import os, runpy; root = os.environ.get('PLUGIN_ROOT') or os.path.expanduser('~/.local/share/codex-reviewer'); runpy.run_path(os.path.join(root, 'skills/codex-review/scripts/codex_mcp.py'), run_name='__main__')"
+      ]
+    }
+  }
+}

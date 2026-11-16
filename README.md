@@ -1,0 +1,77 @@
+# codex-reviewer
+
+Antigravity (AGY) plugin integrating non-interactive, read-only Codex second-opinion reviews (`gpt-6.1-sol` + `high` reasoning effort by default) with zero-restart hot-reloaded model configuration and AGY-primary adjudication.
+
+## Features
+
+- **Seamless MCP integration**: Native `codex_review`, `codex_followup`, and `codex_review_config` tools via pure-stdlib Python 3 stdio MCP (no third-party Python dependencies, no interactive confirmation prompts).
+- **Read-only codebase verification**: Runs `codex -a never -s read-only exec ...` in your workspace so Codex checks real files, equations, and code-to-method alignment without modifying files.
+- **Anti-nitpick built-in templates**: Audits `science`, `plan`, and `code` modes for fundamental defects (calculation errors, data leakage, bugs, plan-code drift, unsupported conclusions) while explicitly suppressing tone-policing or hedging feedback.
+- **AGY-primary adjudication**: Bundled `rules/AGENTS.md` enforces independent verification—mandatory adoption of verified fundamental defects, automatic filtering of stylistic/tone nitpicks.
+- **Hot-reloaded model config**: Change models or reasoning effort anytime via CLI, chat, or JSON without restarting AGY.
+
+## Prerequisites (on any machine)
+
+1. [Antigravity CLI (`agy`)](https://antigravity.google/docs)
+2. [Codex CLI (`codex`)](https://github.com/openai/codex) installed and authenticated (`codex login`)
+3. `python3` (3.9+, standard library only)
+
+## Installation on Another Computer
+
+```bash
+git clone https://github.com/bingbing12138/codex-review.git ~/.local/share/codex-reviewer
+~/.local/share/codex-reviewer/install.sh
+```
+
+Then start a new `agy` session (or restart the IDE/desktop app). Verify installation with:
+
+```bash
+agy plugin list
+codex-review-config status
+```
+
+> If `codex-review-config` is not found in your shell, add `~/.local/bin` to your `PATH` (e.g., `export PATH="$HOME/.local/bin:$PATH"`).
+
+## Updating to Latest Version
+
+```bash
+cd ~/.local/share/codex-reviewer && git pull && ./install.sh
+```
+
+Existing `~/.config/codex-reviewer/config.json` customizations are preserved during updates.
+
+## Switching Models / Updating Codex Settings (Zero Restart)
+
+Runtime config lives at `~/.config/codex-reviewer/config.json` and is re-read on every tool call:
+
+1. **Terminal CLI**:
+   ```bash
+   codex-review-config status
+   codex-review-config set gpt-6-astra xhigh
+   codex-review-config set gpt-6.1-sol high
+   codex-review-config reset
+   ```
+2. **In AGY Chat**: Tell AGY *"把 codex review 模型切到 gpt-6-astra xhigh"* (uses `codex_review_config`).
+3. **Edit JSON directly**: `~/.config/codex-reviewer/config.json`.
+
+## Plugin Layout
+
+```text
+codex-reviewer/
+├── plugin.json
+├── mcp_config.json
+├── install.sh
+├── bin/
+│   └── codex-review-config
+├── rules/
+│   └── AGENTS.md
+└── skills/
+    └── codex-review/
+        ├── SKILL.md
+        ├── references/prompts/
+        │   ├── science_review.md
+        │   ├── plan_review.md
+        │   └── code_review.md
+        └── scripts/
+            └── codex_mcp.py
+```
