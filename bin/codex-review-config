@@ -27,7 +27,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-6.1-sol",
     "reasoning_effort": "high",
     "codex_bin": "codex",
-    "timeout_sec": 300,
+    "timeout_sec": 0,
     "extra_codex_args": [],
     "model_aliases": {
         "gpt-sol 6.1": "gpt-6.1-sol",
@@ -172,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     set_p.add_argument("positional_effort", nargs="?", help="Reasoning effort (low|medium|high|xhigh|max|ultra|none).")
     set_p.add_argument("--model", "-m", dest="flag_model", help="Model slug or alias.")
     set_p.add_argument("--effort", "-e", dest="flag_effort", help="Reasoning effort.")
-    set_p.add_argument("--timeout", type=int, help="Subprocess timeout in seconds.")
+    set_p.add_argument("--timeout", type=int, help="Subprocess timeout in seconds (0 = unlimited, no time limit).")
     set_p.add_argument("--codex-bin", help="Path to codex binary.")
     set_p.add_argument("--add-arg", action="append", default=[], help="Append an extra CLI flag passed to codex.")
     set_p.add_argument("--clear-args", action="store_true", help="Clear extra_codex_args.")
@@ -207,8 +207,8 @@ def main(argv: list[str] | None = None) -> int:
         if resolved_effort is not None:
             cfg["reasoning_effort"] = resolved_effort
         if args.timeout is not None:
-            if args.timeout <= 0:
-                print("Error: --timeout must be positive.", file=sys.stderr)
+            if args.timeout < 0:
+                print("Error: --timeout must be >= 0 (0 = unlimited).", file=sys.stderr)
                 return 2
             cfg["timeout_sec"] = args.timeout
         if args.codex_bin is not None:

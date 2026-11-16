@@ -1,14 +1,16 @@
 # codex-reviewer
 
-Antigravity (AGY) plugin integrating non-interactive, read-only Codex second-opinion reviews (`gpt-6.1-sol` + `high` reasoning effort by default) with zero-restart hot-reloaded model configuration and AGY-primary adjudication.
+Antigravity (AGY) plugin integrating non-interactive, read-only Codex second-opinion reviews (`gpt-6.1-sol` + `high` reasoning effort, `timeout_sec: 0` = unlimited by default) with zero-restart hot-reloaded model configuration and AGY-primary adjudication.
 
 ## Features
 
-- **Seamless MCP integration**: Native `codex_review`, `codex_followup`, and `codex_review_config` tools via pure-stdlib Python 3 stdio MCP (no third-party Python dependencies, no interactive confirmation prompts).
+- **Dual Execution Channels**:
+  - **MCP (`codex_review`, `codex_followup`, `codex_review_config`)**: Seamless zero-prompt reviews for routine checks (< 3 min).
+  - **Async Background CLI (`codex-review-run`)**: Designed for deep, large-codebase reviews (30–60+ min) via AGY background tasks—zero timeout cap (`timeout_sec: 0`), zero polling/token burn while Codex thinks, automatic AGY wakeup on completion, and full report saved to disk.
 - **Read-only codebase verification**: Runs `codex -a never -s read-only exec ...` in your workspace so Codex checks real files, equations, and code-to-method alignment without modifying files.
 - **Anti-nitpick built-in templates**: Audits `science`, `plan`, and `code` modes for fundamental defects (calculation errors, data leakage, bugs, plan-code drift, unsupported conclusions) while explicitly suppressing tone-policing or hedging feedback.
 - **AGY-primary adjudication**: Bundled `rules/AGENTS.md` enforces independent verification—mandatory adoption of verified fundamental defects, automatic filtering of stylistic/tone nitpicks.
-- **Hot-reloaded model config**: Change models or reasoning effort anytime via CLI, chat, or JSON without restarting AGY.
+- **Hot-reloaded model config**: Change models, reasoning effort, or timeout anytime via CLI, chat, or JSON without restarting AGY.
 
 ## Prerequisites (on any machine)
 
@@ -28,9 +30,10 @@ Then start a new `agy` session (or restart the IDE/desktop app). Verify installa
 ```bash
 agy plugin list
 codex-review-config status
+codex-review-run --help
 ```
 
-> If `codex-review-config` is not found in your shell, add `~/.local/bin` to your `PATH` (e.g., `export PATH="$HOME/.local/bin:$PATH"`).
+> If `codex-review-config` or `codex-review-run` is not found in your shell, add `~/.local/bin` to your `PATH` (e.g., `export PATH="$HOME/.local/bin:$PATH"`).
 
 ## Updating to Latest Version
 
@@ -42,13 +45,14 @@ Existing `~/.config/codex-reviewer/config.json` customizations are preserved dur
 
 ## Switching Models / Updating Codex Settings (Zero Restart)
 
-Runtime config lives at `~/.config/codex-reviewer/config.json` and is re-read on every tool call:
+Runtime config lives at `~/.config/codex-reviewer/config.json` and is re-read on every tool call (`timeout_sec: 0` means no subprocess timeout limit):
 
 1. **Terminal CLI**:
    ```bash
    codex-review-config status
    codex-review-config set gpt-6-astra xhigh
    codex-review-config set gpt-6.1-sol high
+   codex-review-config set --timeout 0
    codex-review-config reset
    ```
 2. **In AGY Chat**: Tell AGY *"把 codex review 模型切到 gpt-6-astra xhigh"* (uses `codex_review_config`).
@@ -62,7 +66,8 @@ codex-reviewer/
 ├── mcp_config.json
 ├── install.sh
 ├── bin/
-│   └── codex-review-config
+│   ├── codex-review-config
+│   └── codex-review-run
 ├── rules/
 │   └── AGENTS.md
 └── skills/

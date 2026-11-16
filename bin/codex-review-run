@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Standalone async-friendly CLI runner sharing codex-reviewer prompts, config, and Codex engine."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+def load_codex_mcp_module() -> Any:
+    """Locate and load codex_mcp.py from plugin environment or standard install paths."""
+    candidates: list[Path] = []
+    env_root = os.environ.get("PLUGIN_ROOT", "").strip()
+    if env_root:
+        candidates.append(Path(env_root))
+    candidates.extend(
+        [
+            Path(__file__).resolve().parent.parent,
+            Path.home() / ".gemini" / "config" / "plugins" / "codex-reviewer",
+            Path.home() / ".local" / "share" / "codex-reviewer",
+        ]
+    )
+
+    for root in candidates:
+        script_path = root / "skills" / "codex-review" / "scripts" / "codex_mcp.py"
+        if script_path.exists():
+            spec = importlib.util.spec_from_file_location("codex_mcp", str(script_path))
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules["codex_mcp"] = module
+                spec.loader.exec_module(module)
+                return module
+
+    searched = ", ".join(str(p) for p in candidates)
+    raise FileNotFoundError(f"Could not locate skills/codex-review/scripts/codex_mcp.py in: {searched}")
+
+
+def read_prompt_input(prompt_file: str | None, content: str | None) -> str:
+    """Load review packet or follow-up question from --prompt-file or --content."""
+    if prompt_file:
+        if prompt_file == "-":
+            return sys.stdin.read()
+        path = Path(prompt_file).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"--prompt-file does not exist: {path}")
+        return path.read_text(encoding="utf-8")
+    if content is not None:
+        return content
+    return ""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser for background/long-running Codex reviews."""
+    parser = argparse.ArgumentParser(
+        prog="codex-review-run",
+        description=(
+            "Run a non-interactive read-only Codex review (or session follow-up) via CLI. "
+            "Designed for AGY background tasks with zero timeout limit by default."
+        ),
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["science", "plan", "code"],
+        default="science",
+        help="Review lens (ignored when --followup is set). Default: science.",
+    )
+    parser.add_argument("--workspace", help="Absolute or relative workspace directory (-C).")
+    parser.add_argument(
+        "--prompt-file",
+        help="Path to markdown review packet or follow-up question ('-' reads stdin).",
+    )
+    parser.add_argument("--content", help="Inline review packet or follow-up question.")
+    parser.add_argument(
+        "--focus",
+        action="append",
+        default=[],
+        help="Key file path to inspect (repeatable).",
+    )
+    parser.add_argument(
+        "--git-scope",
+        help="Git diff scope (mode=code only): uncommitted, base:<branch>, or commit:<sha>.",
+    )
+    parser.add_argument("--extra", help="Additional review instructions.")
+    parser.add_argument(
+        "--followup",
+        metavar="SESSION_ID",
+        help="Resume an existing Codex session_id for a follow-up question.",
+    )
+    parser.add_argument("--model", help="One-off model slug or alias override.")
+    parser.add_argument("--effort", help="One-off reasoning effort override.")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="One-off timeout in seconds (0 = unlimited). Defaults to config.json setting.",
+    )
+    parser.add_argument(
+        "--out",
+        help="Output markdown file path (default: /tmp/codex-review-<timestamp>-<pid>.md).",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Execute review or follow-up, save report to disk, and print full result."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        codex_mcp = load_codex_mcp_module()
+        text_input = read_prompt_input(args.prompt_file, args.content)
+
+        if args.followup:
+            payload: dict[str, Any] = {
+                "session_id": args.followup,
+                "question": text_input,
+            }
+            if args.workspace:
+                payload["workspace_dir"] = args.workspace
+            if args.model:
+                payload["model"] = args.model
+            if args.effort:
+                payload["reasoning_effort"] = args.effort
+            if args.timeout is not None:
+                payload["timeout_sec"] = args.timeout
+            result = codex_mcp.handle_codex_followup(payload)
+        else:
+            payload = {
+                "mode": args.mode,
+                "content": text_input,
+            }
+            if args.workspace:
+                payload["workspace_dir"] = args.workspace
+            if args.focus:
+                payload["focus_files"] = args.focus
+            if args.git_scope:
+                payload["git_scope"] = args.git_scope
+            if args.extra:
+                payload["extra_instructions"] = args.extra
+            if args.model:
+                payload["model"] = args.model
+            if args.effort:
+                payload["reasoning_effort"] = args.effort
+            if args.timeout is not None:
+                payload["timeout_sec"] = args.timeout
+            result = codex_mcp.handle_codex_review(payload)
+
+        report_text = result["content"][0]["text"]
+        out_path = (
+            Path(args.out).expanduser()
+            if args.out
+            else Path(f"/tmp/codex-review-{int(time.time())}-{os.getpid()}.md")
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(report_text + "\n", encoding="utf-8")
+
+        print(f"- **saved_report**: `{out_path}`\n")
+        print(report_text)
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

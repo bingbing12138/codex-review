@@ -19,10 +19,11 @@ if ! command -v codex >/dev/null 2>&1; then
   echo "Warning: 'codex' not found in PATH. Install Codex CLI and run 'codex login' before reviewing." >&2
 fi
 
-echo "[2/5] Installing codex-review-config CLI to ${BIN_DIR}/codex-review-config..."
+echo "[2/5] Installing codex-review-config and codex-review-run CLIs to ${BIN_DIR}/..."
 mkdir -p "${BIN_DIR}"
 cp "${SCRIPT_DIR}/bin/codex-review-config" "${BIN_DIR}/codex-review-config"
-chmod +x "${BIN_DIR}/codex-review-config"
+cp "${SCRIPT_DIR}/bin/codex-review-run" "${BIN_DIR}/codex-review-run"
+chmod +x "${BIN_DIR}/codex-review-config" "${BIN_DIR}/codex-review-run"
 
 echo "[3/5] Initializing default runtime config (preserving existing if present)..."
 mkdir -p "${CONFIG_DIR}"
@@ -32,7 +33,7 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
   "model": "gpt-6.1-sol",
   "reasoning_effort": "high",
   "codex_bin": "codex",
-  "timeout_sec": 300,
+  "timeout_sec": 0,
   "extra_codex_args": [],
   "model_aliases": {
     "gpt-sol 6.1": "gpt-6.1-sol",

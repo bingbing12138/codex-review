@@ -33,7 +33,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "model": "gpt-6.1-sol",
     "reasoning_effort": "high",
     "codex_bin": "codex",
-    "timeout_sec": 300,
+    "timeout_sec": 0,
     "extra_codex_args": [],
     "model_aliases": {
         "gpt-sol 6.1": "gpt-6.1-sol",
@@ -285,6 +285,17 @@ def parse_codex_jsonl(stdout_text: str) -> tuple[str | None, str, list[str]]:
     return session_id, last_message, errors
 
 
+def _resolve_timeout_sec(args: dict[str, Any], config: dict[str, Any]) -> int:
+    """Resolve subprocess timeout in seconds; 0 means unlimited (no timeout)."""
+    raw = args.get("timeout_sec")
+    if raw is None:
+        raw = config.get("timeout_sec")
+    timeout_sec = 0 if raw is None else int(raw)
+    if timeout_sec < 0:
+        raise ValueError("'timeout_sec' must be >= 0 (0 means unlimited).")
+    return timeout_sec
+
+
 def run_codex_subprocess(
     cmd: list[str],
     prompt_text: str,
@@ -293,13 +304,14 @@ def run_codex_subprocess(
     out_path: Path,
 ) -> tuple[int, str, str, str | None, str]:
     """Execute Codex CLI with stdin prompt and capture output file + JSONL telemetry."""
+    effective_timeout = timeout_sec if timeout_sec > 0 else None
     proc = subprocess.run(
         cmd,
         input=prompt_text,
         text=True,
         capture_output=True,
         cwd=cwd or None,
-        timeout=timeout_sec,
+        timeout=effective_timeout,
         check=False,
     )
     session_id, jsonl_msg, jsonl_errors = parse_codex_jsonl(proc.stdout or "")
@@ -361,7 +373,7 @@ def handle_codex_review(args: dict[str, Any]) -> dict[str, Any]:
     config = load_config()
     codex_bin = resolve_codex_bin(config)
     model, effort = resolve_model_and_effort(args.get("model"), args.get("reasoning_effort"), config)
-    timeout_sec = int(config.get("timeout_sec") or 300)
+    timeout_sec = _resolve_timeout_sec(args, config)
     extra_args = list(config.get("extra_codex_args") or [])
 
     full_prompt = build_review_prompt(
@@ -472,7 +484,7 @@ def handle_codex_followup(args: dict[str, Any]) -> dict[str, Any]:
     config = load_config()
     codex_bin = resolve_codex_bin(config)
     model, effort = resolve_model_and_effort(args.get("model"), args.get("reasoning_effort"), config)
-    timeout_sec = int(config.get("timeout_sec") or 300)
+    timeout_sec = _resolve_timeout_sec(args, config)
     extra_args = list(config.get("extra_codex_args") or [])
 
     base_cmd = build_base_cmd(codex_bin, model, effort, workspace_dir, extra_args)
@@ -566,8 +578,8 @@ def handle_codex_review_config(args: dict[str, Any]) -> dict[str, Any]:
                     cfg["reasoning_effort"] = resolved_effort
             if args.get("timeout_sec") is not None:
                 timeout_val = int(args["timeout_sec"])
-                if timeout_val <= 0:
-                    raise ValueError("'timeout_sec' must be a positive integer.")
+                if timeout_val < 0:
+                    raise ValueError("'timeout_sec' must be >= 0 (0 means unlimited).")
                 cfg["timeout_sec"] = timeout_val
             if args.get("codex_bin") is not None:
                 cfg["codex_bin"] = str(args["codex_bin"]).strip()
@@ -579,11 +591,14 @@ def handle_codex_review_config(args: dict[str, Any]) -> dict[str, Any]:
 
     resolved_model, resolved_effort = resolve_model_and_effort(None, None, cfg)
     codex_version = _detect_codex_version(str(cfg.get("codex_bin") or "codex"))
+    raw_timeout = cfg.get("timeout_sec")
+    resolved_timeout: str | int = "unlimited" if (raw_timeout is None or int(raw_timeout) == 0) else int(raw_timeout)
     payload = {
         "config_path": str(CONFIG_PATH),
         "codex_version": codex_version,
         "resolved_model": resolved_model,
         "resolved_reasoning_effort": resolved_effort or "model-default",
+        "resolved_timeout": resolved_timeout,
         "config": cfg,
     }
     return {
@@ -639,6 +654,10 @@ TOOLS_SPEC = [
                     "type": "string",
                     "description": "Optional one-off reasoning effort override: low, medium, high, xhigh, max, ultra, or none.",
                 },
+                "timeout_sec": {
+                    "type": "integer",
+                    "description": "Optional one-off subprocess timeout in seconds (0 = unlimited).",
+                },
             },
         },
     },
@@ -673,6 +692,10 @@ TOOLS_SPEC = [
                     "type": "string",
                     "description": "Optional reasoning effort override for this follow-up turn.",
                 },
+                "timeout_sec": {
+                    "type": "integer",
+                    "description": "Optional one-off subprocess timeout in seconds (0 = unlimited).",
+                },
             },
         },
     },
@@ -702,7 +725,7 @@ TOOLS_SPEC = [
                 },
                 "timeout_sec": {
                     "type": "integer",
-                    "description": "Subprocess timeout in seconds.",
+                    "description": "Subprocess timeout in seconds (0 = unlimited, no time limit).",
                 },
                 "codex_bin": {
                     "type": "string",
