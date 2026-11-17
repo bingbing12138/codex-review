@@ -9,10 +9,7 @@ description: >-
 
 # Codex Second-Opinion Review Workflow
 
-This plugin provides **two execution channels** sharing one unified adaptive prompt ([review.md](./references/prompts/review.md)) and hot-reloaded `~/.config/codex-reviewer/config.json` (`gpt-6.1-sol` + `high` reasoning effort, `timeout_sec: 0` = unlimited by default):
-
-1. **Native MCP Channel (`codex_review`, `codex_followup`, `codex_review_config`)**: Best for fast/routine reviews (< 3 minutes) with zero terminal prompts.
-2. **Async Background CLI Channel (`codex-review-run`)**: Best for deep, large-codebase, or long-running reviews (5–60+ minutes, `xhigh`/`max`/`ultra`, or explicit async requests) with **zero timeout cap** and **zero polling**.
+This plugin runs **all reviews as detached, unlimited-duration background jobs** via MCP (`codex_review`, `codex_followup`, `codex_review_status`, `codex_review_config`) paired with a sandbox-safe local waiter (`codex-review-wait`)—giving you **no runtime cap (30+ min supported)**, **zero network permission prompts**, and **zero polling**.
 
 ## 1. Prepare a De-Biased Review Packet
 
@@ -20,35 +17,33 @@ Before launching Codex, summarize the target objectively so Codex neither agrees
 
 1. **Problem & Goal**: What scientific hypothesis, computational task, plan, or feature is being designed/implemented/evaluated.
 2. **Method, Equations, or Plan**: Concrete steps, mathematical definitions, normalization/split rules, or architectural invariants.
-3. **Observed Evidence / Claims**: Quantitative outputs, metrics, or final conclusions under review (omit if pre-implementation plan).
-4. **Workspace & Key Files**: Always provide `workspace_dir` (`--workspace`) and `focus_files` (`--focus`) — and optionally `git_scope` (`"uncommitted"`, `"base:<branch>"`, `"commit:<sha>"`) — so Codex reads the real files in `--sandbox read-only` mode rather than relying solely on prose.
+3. **Observed Evidence & Experimental Context**: Quantitative metrics AND exact references/paths to raw outputs, evaluation logs, dataset split/filtering definitions, sample sizes (`N`), random seeds/statistical tests, and baseline configurations (omit if pre-implementation plan).
+4. **Workspace & Key Files**: Always provide `workspace_dir` and `focus_files` — and optionally `git_scope` (`"uncommitted"`, `"base:<branch>"`, `"commit:<sha>"`) — so Codex reads the real files in `--sandbox read-only` mode rather than relying solely on prose.
 
 Do not use leading or self-defending wording (e.g., avoid *"confirm that this method is optimal"*).
 
-## 2. Launch Review via Fast MCP or Async Background CLI
+## 2. Launch Background Review & Sleep Until Automatic Wakeup
 
-The single unified prompt ([review.md](./references/prompts/review.md)) automatically adapts to **plans, standalone math/science, pure software engineering code, and joint scientific + code frameworks** without needing a `mode` parameter.
+The unified adaptive prompt ([review.md](./references/prompts/review.md)) handles plans, standalone math/science, pure engineering code, and joint scientific + code frameworks without needing a `mode` parameter.
 
-### Channel A: Fast / Routine Reviews (Native MCP)
-Call `codex_review` directly. Do not override `model` or `reasoning_effort` unless the user explicitly asks.
-
-### Channel B: Deep / Complex / Long-Running Reviews (`codex-review-run` Background Wakeup)
-Use when reviewing large multi-file codebases, complex scientific pipelines, using `xhigh`/`max`/`ultra`, or whenever the review could run 5–60+ minutes:
-
-1. Write the de-biased review packet to `<artifactDir>/scratch/codex_packet.md`.
-2. Launch `~/.local/bin/codex-review-run` (or `codex-review-run`) via `run_command` with `WaitMsBeforeAsync: 500` using a clean literal-argument command (no `&&`, pipes, or `$VAR` so prefix auto-approval works):
-   ```text
-   codex-review-run --workspace <dir> --prompt-file <artifactDir>/scratch/codex_packet.md --out <artifactDir>/scratch/codex_report.md [--focus <file> ...] [--git-scope <scope>]
-   ```
-   Follow standard sandbox execution rules (try sandboxed first; retry with `BypassSandbox: true` keeping identical `toolSummary` if sandbox blocks network/`~/.codex`).
-3. **Stop & Sleep (Zero Polling)**: Once `run_command` moves to background, **end the turn immediately** (do NOT call `manage_task` or `schedule` to poll). AGY stays completely idle with zero token burn until the OS process finishes, at which point AGY is automatically woken up with the completion result.
-4. Read `<artifactDir>/scratch/codex_report.md` if terminal output was truncated.
+1. **Launch via MCP (`codex_review` or `codex_followup`)**:
+   - Call `codex_review` (do not override `model`, `reasoning_effort`, or `timeout_sec` unless asked; defaults are hot-reloaded from `~/.config/codex-reviewer/config.json` with `timeout_sec: 0` = unlimited).
+   - The MCP server spawns a detached worker outside the terminal sandbox and returns `job_id`, `report_path`, and `wait_command` in `< 100ms`.
+2. **Attach Sandboxed Waiter (`codex-review-wait <job_id>`)**:
+   - Immediately run `codex-review-wait <job_id>` (or `~/.local/bin/codex-review-wait <job_id>`) via `run_command` with **`WaitMsBeforeAsync: 5000`** and **`BypassSandbox: false`** (Standard Sandbox works natively because `codex-review-wait` only inspects `/tmp/codex-reviewer-jobs/<job_id>`).
+   - If the review finishes within 5s, you get the report right away; otherwise `run_command` moves to background.
+3. **Stop & Sleep (Zero Polling)**:
+   - Once `codex-review-wait` is in the background, **end the turn immediately** (do NOT poll `manage_task`, `codex_review_status`, or `schedule`).
+   - AGY sleeps at zero token cost until the background task finishes and automatically wakes AGY up with the complete `report.md`.
+4. **Status / Cancel / Fallback**:
+   - Only call `codex_review_status` (`action="get"` / `"cancel"` / `"list"`) if the user explicitly asks for progress or cancellation, or to recover a finished report if the session restarted.
+   - Standalone CLI `codex-review-run` remains available for manual terminal invocations.
 
 ## 3. Independent Verification & Optional Follow-up
 
 After results return:
 1. **Independently inspect** every `[FUNDAMENTAL / MUST-FIX]` and `[VERIFY / EDGE-CASE RISKS]` item against actual code, formulas, and outputs in the workspace.
-2. **Optional 1-turn follow-up**: Only if a critical claim appears to rest on a misread file or missing premise, call `codex_followup` (MCP) or `codex-review-run --followup <session_id> ...` (CLI) to resolve it cleanly.
+2. **Optional 1-turn follow-up**: Only if a critical claim appears to rest on a misread file or missing premise, call `codex_followup` with the returned `session_id` (then `codex-review-wait <new_job_id>`) to resolve it cleanly.
 
 ## 4. Two-Tier Adjudication (AGY Remains Primary)
 
@@ -66,9 +61,10 @@ Apply strict triage before changing code, plans, or conclusions:
 
 ## 5. Report Concisely to the User
 
-Summarize outcome clearly in two short parts:
+Summarize outcome clearly in three short parts:
 1. **Verified & Adopted Fixes**: Any fundamental defects confirmed and fixed (or explicitly state none were found).
-2. **Filtered / Rejected Feedback**: Briefly note in one line any non-substantive items or false positives dismissed after verification.
+2. **Unresolved Substantive Risks**: Any substantive findings or boundary risks that could not yet be verified locally and require follow-up or empirical checks (omit or write `None.` if all substantive items were resolved).
+3. **Filtered / Rejected Feedback**: Briefly note in one line any non-substantive items or false positives dismissed after verification.
 
 ## 6. Model & Config Management
 

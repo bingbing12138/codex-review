@@ -1,15 +1,27 @@
 #!/usr/bin/env python3
-"""Standalone async-friendly CLI runner sharing codex-reviewer prompts, config, and Codex engine."""
+"""CLI wrapper sharing codex-reviewer prompts, config, and detached background engine."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+
+def _load_sibling_module(name: str, script_path: Path) -> Any:
+    """Load a Python module from an explicit path."""
+    spec = importlib.util.spec_from_file_location(name, str(script_path))
+    if spec and spec.loader:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+    raise FileNotFoundError(f"Unable to load module {name} from {script_path}")
 
 
 def load_codex_mcp_module() -> Any:
@@ -29,12 +41,7 @@ def load_codex_mcp_module() -> Any:
     for root in candidates:
         script_path = root / "skills" / "codex-review" / "scripts" / "codex_mcp.py"
         if script_path.exists():
-            spec = importlib.util.spec_from_file_location("codex_mcp", str(script_path))
-            if spec and spec.loader:
-                module = importlib.util.module_from_spec(spec)
-                sys.modules["codex_mcp"] = module
-                spec.loader.exec_module(module)
-                return module
+            return _load_sibling_module("codex_mcp", script_path)
 
     searched = ", ".join(str(p) for p in candidates)
     raise FileNotFoundError(f"Could not locate skills/codex-review/scripts/codex_mcp.py in: {searched}")
@@ -54,13 +61,42 @@ def read_prompt_input(prompt_file: str | None, content: str | None) -> str:
     return ""
 
 
+def _wait_for_job_local(jobs_dir: Path, job_id: str, out_file: str | None) -> int:
+    """Wait for job completion using codex-review-wait logic."""
+    wait_candidates = [
+        Path(__file__).resolve().parent / "codex-review-wait",
+        Path.home() / ".local" / "bin" / "codex-review-wait",
+        Path(__file__).resolve().parent.parent / "bin" / "codex-review-wait",
+    ]
+    for candidate in wait_candidates:
+        if candidate.exists():
+            wait_mod = _load_sibling_module("codex_review_wait", candidate)
+            return int(wait_mod.wait_for_job(job_id, poll_interval=1.0, out_file=out_file))
+
+    job_dir = jobs_dir / job_id
+    done_path = job_dir / "done.json"
+    report_path = job_dir / "report.md"
+    while not done_path.exists():
+        time.sleep(1.0)
+    done = json.loads(done_path.read_text(encoding="utf-8"))
+    report_text = report_path.read_text(encoding="utf-8").strip() if report_path.exists() else ""
+    saved_path = report_path
+    if out_file:
+        saved_path = Path(out_file).expanduser()
+        saved_path.parent.mkdir(parents=True, exist_ok=True)
+        saved_path.write_text(report_text + "\n", encoding="utf-8")
+    print(f"- **saved_report**: `{saved_path}`\n")
+    print(report_text)
+    return 1 if done.get("is_error") else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build CLI argument parser for background/long-running Codex reviews."""
     parser = argparse.ArgumentParser(
         prog="codex-review-run",
         description=(
-            "Run a non-interactive read-only Codex review (or session follow-up) via CLI. "
-            "Designed for AGY background tasks with zero timeout limit by default."
+            "Launch a non-interactive read-only Codex review (or session follow-up) via CLI. "
+            "Runs with zero timeout limit by default."
         ),
     )
     parser.add_argument("--mode", help=argparse.SUPPRESS)
@@ -95,14 +131,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="One-off timeout in seconds (0 = unlimited). Defaults to config.json setting.",
     )
     parser.add_argument(
+        "--detach",
+        action="store_true",
+        help="Print launched job_id JSON and exit immediately instead of waiting for completion.",
+    )
+    parser.add_argument(
         "--out",
-        help="Output markdown file path (default: /tmp/codex-review-<timestamp>-<pid>.md).",
+        help="Optional extra markdown path to copy the finished report.",
     )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Execute review or follow-up, save report to disk, and print full result."""
+    """Launch background Codex job, then detach or wait for completion."""
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -144,18 +185,14 @@ def main(argv: list[str] | None = None) -> int:
                 payload["timeout_sec"] = args.timeout
             result = codex_mcp.handle_codex_review(payload)
 
-        report_text = result["content"][0]["text"]
-        out_path = (
-            Path(args.out).expanduser()
-            if args.out
-            else Path(f"/tmp/codex-review-{int(time.time())}-{os.getpid()}.md")
-        )
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(report_text + "\n", encoding="utf-8")
+        launch_text = result["content"][0]["text"]
+        if args.detach:
+            print(launch_text)
+            return 0
 
-        print(f"- **saved_report**: `{out_path}`\n")
-        print(report_text)
-        return 0
+        launch_info = json.loads(launch_text)
+        job_id = str(launch_info["job_id"])
+        return _wait_for_job_local(codex_mcp.JOBS_DIR, job_id, args.out)
     except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)
         return 1

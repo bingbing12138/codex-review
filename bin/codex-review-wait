@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Sandboxed local waiter for background codex-reviewer jobs in /tmp/codex-reviewer-jobs."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+JOBS_DIR = Path(os.environ.get("CODEX_REVIEWER_JOBS_DIR", "/tmp/codex-reviewer-jobs"))
+
+
+def _pid_definitely_dead(pid: Any) -> bool:
+    """Return True only when OS confirms pid does not exist (ProcessLookupError)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        # Unsandboxed sibling process owned by same user may raise EPERM inside Seatbelt.
+        return False
+
+
+def _resolve_job_dir(job_id: str) -> Path:
+    """Validate job_id and return its directory inside JOBS_DIR."""
+    cleaned = job_id.strip()
+    if not cleaned or not re.fullmatch(r"[A-Za-z0-9._-]+", cleaned):
+        raise ValueError(f"Invalid job_id: {job_id}")
+    job_dir = JOBS_DIR / cleaned
+    if not job_dir.is_dir():
+        raise FileNotFoundError(f"Job directory not found: {job_dir}")
+    return job_dir
+
+
+def wait_for_job(job_id: str, poll_interval: float = 1.0, out_file: str | None = None) -> int:
+    """Wait locally for done.json without network access, then print the finished report."""
+    job_dir = _resolve_job_dir(job_id)
+    done_path = job_dir / "done.json"
+    status_path = job_dir / "status.json"
+    report_path = job_dir / "report.md"
+
+    while True:
+        if done_path.exists():
+            done = json.loads(done_path.read_text(encoding="utf-8"))
+            report_text = (
+                report_path.read_text(encoding="utf-8").strip()
+                if report_path.exists()
+                else json.dumps(done, indent=2, ensure_ascii=False)
+            )
+            saved_path = report_path
+            if out_file:
+                saved_path = Path(out_file).expanduser()
+                saved_path.parent.mkdir(parents=True, exist_ok=True)
+                saved_path.write_text(report_text + "\n", encoding="utf-8")
+
+            print(f"- **saved_report**: `{saved_path}`\n")
+            print(report_text)
+            return 1 if done.get("is_error") else 0
+
+        if status_path.exists():
+            try:
+                status = json.loads(status_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                status = {}
+            worker_pid = status.get("worker_pid")
+            heartbeat_ts = float(status.get("heartbeat_ts") or status.get("started_at") or time.time())
+            stale = (time.time() - heartbeat_ts) > 30.0
+            if _pid_definitely_dead(worker_pid) or stale:
+                # Re-check done.json right after PID check to avoid exit TOCTOU race.
+                time.sleep(0.1)
+                if done_path.exists():
+                    continue
+                if _pid_definitely_dead(worker_pid):
+                    print(
+                        f"Error: background worker (pid={worker_pid}) exited without writing done.json.",
+                        file=sys.stderr,
+                    )
+                    log_path = job_dir / "worker.log"
+                    if log_path.exists():
+                        tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-25:])
+                        if tail:
+                            print(f"\n--- worker.log (tail) ---\n{tail}", file=sys.stderr)
+                    return 1
+
+        time.sleep(poll_interval)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build CLI argument parser for codex-review-wait."""
+    parser = argparse.ArgumentParser(
+        prog="codex-review-wait",
+        description=(
+            "Wait locally (sandbox-compatible, zero network) for a background codex-reviewer job "
+            "to finish and print its complete review report."
+        ),
+    )
+    parser.add_argument("job_id", help="Job ID returned by codex_review or codex_followup.")
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=1.0,
+        help="Local file check interval in seconds (default: 1.0).",
+    )
+    parser.add_argument(
+        "--out",
+        help="Optional extra path to copy the final markdown report.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Entry point for codex-review-wait."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.poll_interval <= 0:
+        print("Error: --poll-interval must be positive.", file=sys.stderr)
+        return 2
+    try:
+        return wait_for_job(args.job_id, poll_interval=args.poll_interval, out_file=args.out)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

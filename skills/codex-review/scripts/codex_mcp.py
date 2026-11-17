@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stdio MCP server wrapping the local Codex CLI for read-only second-opinion reviews."""
+"""Detached background-job MCP server & worker wrapping the local Codex CLI."""
 
 from __future__ import annotations
 
@@ -7,21 +7,48 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
 SERVER_NAME = "codex-reviewer"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "2.0.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
+SUPPORTED_PROTOCOL_VERSIONS = (
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+)
+_EOF = object()
 
 CONFIG_PATH = Path(
     os.environ.get(
         "CODEX_REVIEWER_CONFIG",
         str(Path.home() / ".config" / "codex-reviewer" / "config.json"),
+    )
+)
+CACHE_DIR = Path(
+    os.environ.get(
+        "CODEX_REVIEWER_CACHE",
+        str(Path.home() / ".cache" / "codex-reviewer"),
+    )
+)
+SESSIONS_PATH = CACHE_DIR / "sessions.json"
+JOBS_DIR = Path(
+    os.environ.get(
+        "CODEX_REVIEWER_JOBS_DIR",
+        "/tmp/codex-reviewer-jobs",
     )
 )
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "references" / "prompts"
@@ -52,12 +79,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 SERVER_INSTRUCTIONS = (
     "AGY is the lead engineer and scientific investigator with final decision authority; "
-    "Codex provides strictly advisory read-only second opinions. Always verify Codex findings "
-    "against actual workspace code, math, and data before deciding. Must-adopt verified "
-    "fundamental bugs, data/formula calculation errors, data leakage, plan-implementation "
-    "mismatches, and false conclusions; filter and ignore tone policing, hedging complaints, "
-    "and purely stylistic nitpicks. Runtime config hot-reloads from "
-    f"{CONFIG_PATH}."
+    "Codex provides strictly advisory read-only second opinions. codex_review and codex_followup "
+    "launch detached background jobs with NO duration cap (returning job_id immediately). "
+    "Run `codex-review-wait <job_id>` via run_command (BypassSandbox: false, WaitMsBeforeAsync: 5000) "
+    "and end your turn to sleep with zero polling until automatic wakeup. Always verify Codex findings "
+    "against actual workspace code, math, and data before deciding: adopt verified fundamental defects "
+    "and ignore tone policing or stylistic nitpicks."
 )
 
 
@@ -77,6 +104,43 @@ def _merge_config(raw: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def _lock_file(lock_path: Path):
+    """Acquire an exclusive advisory lock when fcntl is available."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = open(lock_path, "a+", encoding="utf-8")
+    if fcntl is not None:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+    return lock_fh
+
+
+def _unlock_file(lock_fh: Any) -> None:
+    """Release an advisory lock cleanly."""
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_fh.close()
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text atomically using a same-directory temp file and os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp_name, path)
+    except Exception:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    """Write JSON atomically using a same-directory temp file and os.replace."""
+    _atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
 def load_config() -> dict[str, Any]:
     """Load runtime config from disk on every call for zero-restart hot reload."""
     if not CONFIG_PATH.exists():
@@ -91,18 +155,63 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(cfg: dict[str, Any]) -> None:
-    """Persist runtime config atomically."""
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=str(CONFIG_PATH.parent))
+    """Persist runtime config atomically under an advisory lock."""
+    lock_fh = _lock_file(CONFIG_PATH.with_suffix(".lock"))
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh, indent=2, ensure_ascii=False)
-            fh.write("\n")
-        os.replace(tmp_name, CONFIG_PATH)
-    except Exception:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
-        raise
+        _atomic_write_json(CONFIG_PATH, cfg)
+    finally:
+        _unlock_file(lock_fh)
+
+
+def update_config(mutator: Any) -> dict[str, Any]:
+    """Load, mutate, and save config under a single exclusive lock."""
+    lock_fh = _lock_file(CONFIG_PATH.with_suffix(".lock"))
+    try:
+        cfg = load_config()
+        updated = mutator(cfg)
+        _atomic_write_json(CONFIG_PATH, updated)
+        return updated
+    finally:
+        _unlock_file(lock_fh)
+
+
+def _record_session_workspace(session_id: str | None, workspace_dir: str | None) -> None:
+    """Best-effort cache of session_id -> workspace_dir for workspace-safe follow-ups."""
+    if not session_id or not workspace_dir:
+        return
+    try:
+        lock_fh = _lock_file(SESSIONS_PATH.with_suffix(".lock"))
+        try:
+            sessions: dict[str, str] = {}
+            if SESSIONS_PATH.exists():
+                raw = json.loads(SESSIONS_PATH.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    sessions = {str(k): str(v) for k, v in raw.items()}
+            sessions.pop(session_id, None)
+            sessions[session_id] = workspace_dir
+            while len(sessions) > 100:
+                oldest = next(iter(sessions))
+                sessions.pop(oldest)
+            _atomic_write_json(SESSIONS_PATH, sessions)
+        finally:
+            _unlock_file(lock_fh)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[{SERVER_NAME}] note: could not cache session workspace: {exc}", file=sys.stderr)
+
+
+def _lookup_session_workspace(session_id: str) -> str | None:
+    """Retrieve previously recorded workspace_dir for session_id, if valid."""
+    try:
+        if not SESSIONS_PATH.exists():
+            return None
+        raw = json.loads(SESSIONS_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            val = raw.get(session_id)
+            if isinstance(val, str) and val and os.path.isdir(val):
+                return val
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def resolve_model_and_effort(
@@ -227,11 +336,59 @@ def build_base_cmd(
     return cmd
 
 
-def parse_codex_jsonl(stdout_text: str) -> tuple[str | None, str, list[str]]:
-    """Extract session/thread ID, fallback agent message, and errors from Codex JSONL."""
+def _extract_event_fields(
+    event: dict[str, Any],
+) -> tuple[str | None, str | None, str | None, bool, bool]:
+    """Extract (session_id, agent_message, error_text, is_completed, is_failed) from one event."""
+    sid: str | None = None
+    for key in ("thread_id", "session_id"):
+        val = event.get(key)
+        if isinstance(val, str) and val:
+            sid = val
+            break
+    if not sid:
+        for container in ("thread", "session", "msg", "payload"):
+            sub = event.get(container)
+            if isinstance(sub, dict):
+                val = sub.get("id") or sub.get("session_id") or sub.get("thread_id")
+                if isinstance(val, str) and val:
+                    sid = val
+                    break
+
+    agent_msg: str | None = None
+    item = event.get("item")
+    if isinstance(item, dict) and item.get("type") == "agent_message":
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            agent_msg = text.strip()
+    if agent_msg is None:
+        msg = event.get("msg")
+        if isinstance(msg, dict) and msg.get("type") == "agent_message":
+            text = msg.get("message") or msg.get("text")
+            if isinstance(text, str) and text.strip():
+                agent_msg = text.strip()
+
+    ev_type = str(event.get("type") or "").lower()
+    is_completed = ev_type == "turn.completed"
+    is_failed = ev_type == "turn.failed"
+    err_text: str | None = None
+    if ev_type in ("error", "turn.failed", "stream_error"):
+        err_val = event.get("error") or event.get("message")
+        if isinstance(err_val, dict):
+            err_val = err_val.get("message") or json.dumps(err_val, ensure_ascii=False)
+        if err_val:
+            err_text = str(err_val)
+
+    return sid, agent_msg, err_text, is_completed, is_failed
+
+
+def parse_codex_jsonl(stdout_text: str) -> tuple[str | None, str, list[str], bool]:
+    """Extract session ID, final agent message, errors, and turn failure flag from JSONL."""
     session_id: str | None = None
     messages: list[str] = []
     errors: list[str] = []
+    turn_failed = False
+    turn_completed = False
 
     for line in stdout_text.splitlines():
         raw = line.strip()
@@ -244,43 +401,23 @@ def parse_codex_jsonl(stdout_text: str) -> tuple[str | None, str, list[str]]:
         if not isinstance(event, dict):
             continue
 
-        if not session_id:
-            for key in ("thread_id", "session_id"):
-                val = event.get(key)
-                if isinstance(val, str) and val:
-                    session_id = val
-                    break
-            if not session_id:
-                for container in ("thread", "session", "msg", "payload"):
-                    sub = event.get(container)
-                    if isinstance(sub, dict):
-                        val = sub.get("id") or sub.get("session_id") or sub.get("thread_id")
-                        if isinstance(val, str) and val:
-                            session_id = val
-                            break
+        sid, agent_msg, err_text, is_comp, is_fail = _extract_event_fields(event)
+        if not session_id and sid:
+            session_id = sid
+        if agent_msg:
+            messages.append(agent_msg)
+        if is_comp:
+            turn_completed = True
+        if is_fail:
+            turn_failed = True
+        if err_text:
+            errors.append(err_text)
 
-        item = event.get("item")
-        if isinstance(item, dict) and item.get("type") == "agent_message":
-            text = item.get("text")
-            if isinstance(text, str) and text.strip():
-                messages.append(text.strip())
-
-        msg = event.get("msg")
-        if isinstance(msg, dict) and msg.get("type") == "agent_message":
-            text = msg.get("message") or msg.get("text")
-            if isinstance(text, str) and text.strip():
-                messages.append(text.strip())
-
-        ev_type = str(event.get("type") or "").lower()
-        if ev_type in ("error", "turn.failed", "stream_error"):
-            err_val = event.get("error") or event.get("message")
-            if isinstance(err_val, dict):
-                err_val = err_val.get("message") or json.dumps(err_val, ensure_ascii=False)
-            if err_val:
-                errors.append(str(err_val))
+    if errors and not turn_completed and not messages:
+        turn_failed = True
 
     last_message = messages[-1] if messages else ""
-    return session_id, last_message, errors
+    return session_id, last_message, errors, turn_failed
 
 
 def _resolve_timeout_sec(args: dict[str, Any], config: dict[str, Any]) -> int:
@@ -292,36 +429,6 @@ def _resolve_timeout_sec(args: dict[str, Any], config: dict[str, Any]) -> int:
     if timeout_sec < 0:
         raise ValueError("'timeout_sec' must be >= 0 (0 means unlimited).")
     return timeout_sec
-
-
-def run_codex_subprocess(
-    cmd: list[str],
-    prompt_text: str,
-    cwd: str | None,
-    timeout_sec: int,
-    out_path: Path,
-) -> tuple[int, str, str, str | None, str]:
-    """Execute Codex CLI with stdin prompt and capture output file + JSONL telemetry."""
-    effective_timeout = timeout_sec if timeout_sec > 0 else None
-    proc = subprocess.run(
-        cmd,
-        input=prompt_text,
-        text=True,
-        capture_output=True,
-        cwd=cwd or None,
-        timeout=effective_timeout,
-        check=False,
-    )
-    session_id, jsonl_msg, jsonl_errors = parse_codex_jsonl(proc.stdout or "")
-    file_text = ""
-    if out_path.exists():
-        file_text = out_path.read_text(encoding="utf-8").strip()
-    final_text = file_text or jsonl_msg
-    combined_err = (proc.stderr or "").strip()
-    if jsonl_errors:
-        joined = "\n".join(jsonl_errors)
-        combined_err = f"{combined_err}\n{joined}".strip() if combined_err else joined
-    return proc.returncode, final_text, combined_err, session_id, (proc.stdout or "")
 
 
 def _validate_workspace(workspace_dir: str | None) -> str | None:
@@ -349,14 +456,509 @@ def _parse_git_scope(git_scope: str) -> list[str]:
     )
 
 
+def _ensure_jobs_dir() -> Path:
+    """Ensure /tmp/codex-reviewer-jobs exists with owner-only permissions."""
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(JOBS_DIR, 0o700)
+    except OSError:
+        pass
+    return JOBS_DIR
+
+
+def _prune_old_jobs(max_age_sec: int = 7 * 86400) -> None:
+    """Best-effort cleanup of completed job directories older than max_age_sec."""
+    if not JOBS_DIR.exists():
+        return
+    cutoff = time.time() - max_age_sec
+    try:
+        for entry in JOBS_DIR.iterdir():
+            if not entry.is_dir():
+                continue
+            done_file = entry / "done.json"
+            if not done_file.exists():
+                continue
+            try:
+                if done_file.stat().st_mtime < cutoff:
+                    shutil.rmtree(entry, ignore_errors=True)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def _pid_definitely_dead(pid: Any) -> bool:
+    """Return True only when OS confirms pid does not exist (ProcessLookupError)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return False
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+
+def _terminate_process_group(pid: int | None) -> None:
+    """Send SIGTERM then SIGKILL to a detached process group cleanly."""
+    if not pid or pid <= 0:
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if _pid_definitely_dead(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _validate_job_id(job_id: str) -> Path:
+    """Validate job_id format and resolve its directory under JOBS_DIR."""
+    cleaned = job_id.strip()
+    if not cleaned or not re.fullmatch(r"[A-Za-z0-9._-]+", cleaned):
+        raise ValueError(f"Invalid job_id: {job_id}")
+    job_dir = JOBS_DIR / cleaned
+    if not job_dir.is_dir():
+        raise FileNotFoundError(f"Job not found: {cleaned}")
+    return job_dir
+
+
+def start_background_job(request_data: dict[str, Any]) -> dict[str, Any]:
+    """Persist request metadata and spawn a detached worker process."""
+    _ensure_jobs_dir()
+    _prune_old_jobs()
+
+    job_id = f"rev-{time.strftime('%Y%m%d-%H%M%S')}-{os.urandom(3).hex()}"
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(job_dir, 0o700)
+    except OSError:
+        pass
+
+    request_data["job_id"] = job_id
+    _atomic_write_json(job_dir / "request.json", request_data)
+
+    now = time.time()
+    report_path = str(job_dir / "report.md")
+    status: dict[str, Any] = {
+        "job_id": job_id,
+        "kind": request_data["kind"],
+        "state": "running",
+        "model": request_data["model"],
+        "reasoning_effort": request_data["effort"] or "model-default",
+        "timeout_sec": request_data["timeout_sec"],
+        "workspace_dir": request_data.get("workspace_dir"),
+        "session_id": request_data.get("session_id"),
+        "started_at": now,
+        "heartbeat_ts": now,
+        "elapsed_sec": 0.0,
+        "worker_pid": None,
+        "codex_pid": None,
+        "report_path": report_path,
+        "wait_command": f"codex-review-wait {job_id}",
+    }
+    _atomic_write_json(job_dir / "status.json", status)
+
+    worker_cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", str(job_dir)]
+    with open(job_dir / "worker.log", "a", encoding="utf-8") as log_fh:
+        proc = subprocess.Popen(
+            worker_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    status["worker_pid"] = proc.pid
+    _atomic_write_json(job_dir / "status.json", status)
+    return status
+
+
+def _run_streaming_codex(
+    cmd: list[str],
+    prompt_text: str,
+    cwd: str | None,
+    timeout_sec: int,
+    out_path: Path,
+    job_dir: Path,
+    status: dict[str, Any],
+    start_mono: float,
+) -> tuple[int, str, str, str | None, bool, bool, bool]:
+    """Run Codex CLI with streaming JSONL heartbeat, session capture, and cancel support."""
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd or None,
+        start_new_session=True,
+    )
+    status["codex_pid"] = proc.pid
+    _atomic_write_json(job_dir / "status.json", status)
+
+    lock = threading.Lock()
+    messages: list[str] = []
+    errors: list[str] = []
+    stderr_lines: list[str] = []
+    state = {"session_id": status.get("session_id"), "completed": False, "failed": False}
+
+    def _feed_stdin() -> None:
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write(prompt_text)
+                proc.stdin.close()
+        except OSError:
+            pass
+
+    def _read_stderr() -> None:
+        if proc.stderr is None:
+            return
+        for line in proc.stderr:
+            with lock:
+                stderr_lines.append(line.rstrip("\n"))
+
+    def _read_stdout() -> None:
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            raw = line.strip()
+            if not raw or not raw.startswith("{"):
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+
+            sid, agent_msg, err_text, is_comp, is_fail = _extract_event_fields(event)
+            new_sid = None
+            with lock:
+                if sid and not state["session_id"]:
+                    state["session_id"] = sid
+                    status["session_id"] = sid
+                    new_sid = sid
+                if agent_msg:
+                    messages.append(agent_msg)
+                if is_comp:
+                    state["completed"] = True
+                if is_fail:
+                    state["failed"] = True
+                if err_text:
+                    errors.append(err_text)
+            if new_sid:
+                _record_session_workspace(new_sid, cwd)
+                _atomic_write_json(job_dir / "status.json", status)
+
+    t_in = threading.Thread(target=_feed_stdin, daemon=True)
+    t_err = threading.Thread(target=_read_stderr, daemon=True)
+    t_out = threading.Thread(target=_read_stdout, daemon=True)
+    t_in.start()
+    t_err.start()
+    t_out.start()
+
+    canceled = False
+    timed_out = False
+    last_hb = time.monotonic()
+
+    while proc.poll() is None:
+        if (job_dir / "cancel.flag").exists():
+            canceled = True
+            _terminate_process_group(proc.pid)
+            break
+        elapsed_now = time.monotonic() - start_mono
+        if timeout_sec > 0 and elapsed_now > timeout_sec:
+            timed_out = True
+            _terminate_process_group(proc.pid)
+            break
+        if time.monotonic() - last_hb >= 2.0:
+            last_hb = time.monotonic()
+            with lock:
+                status["heartbeat_ts"] = time.time()
+                status["elapsed_sec"] = round(elapsed_now, 2)
+                _atomic_write_json(job_dir / "status.json", status)
+        time.sleep(0.5)
+
+    rc = proc.wait()
+    if (job_dir / "cancel.flag").exists():
+        canceled = True
+    t_in.join(timeout=2.0)
+    t_out.join(timeout=2.0)
+    t_err.join(timeout=2.0)
+
+    with lock:
+        session_id = state["session_id"]
+        turn_failed = bool(state["failed"])
+        if errors and not state["completed"] and not messages:
+            turn_failed = True
+        jsonl_msg = messages[-1] if messages else ""
+        stderr_text = "\n".join(stderr_lines).strip()
+        if errors:
+            joined = "\n".join(errors)
+            stderr_text = f"{stderr_text}\n{joined}".strip() if stderr_text else joined
+
+    file_text = out_path.read_text(encoding="utf-8").strip() if out_path.exists() else ""
+    final_text = file_text or jsonl_msg
+    return rc, final_text, stderr_text, session_id, turn_failed, canceled, timed_out
+
+
+def run_worker_main(job_dir_str: str) -> int:
+    """Detached worker entry point: executes Codex with no duration limit and writes done.json."""
+    job_dir = Path(job_dir_str).resolve()
+    req = json.loads((job_dir / "request.json").read_text(encoding="utf-8"))
+    status = json.loads((job_dir / "status.json").read_text(encoding="utf-8"))
+
+    kind = req["kind"]
+    job_id = req["job_id"]
+    model = req["model"]
+    effort = req["effort"]
+    codex_bin = req["codex_bin"]
+    extra_args = req.get("extra_args") or []
+    workspace_dir = req.get("workspace_dir")
+    timeout_sec = int(req.get("timeout_sec") or 0)
+    git_scope = req.get("git_scope")
+    prompt_text = req["prompt"]
+    initial_sid = req.get("session_id")
+
+    start_mono = time.monotonic()
+    rc = 1
+    final_text = ""
+    stderr_text = ""
+    session_id = initial_sid
+    turn_failed = False
+    canceled = False
+    timed_out = False
+    used_subcommand = "exec resume" if kind == "followup" else "exec"
+    fatal_exc: str | None = None
+
+    try:
+        if (job_dir / "cancel.flag").exists():
+            canceled = True
+        else:
+            base_cmd = build_base_cmd(codex_bin, model, effort, workspace_dir, extra_args)
+            with tempfile.TemporaryDirectory(prefix="codex-worker-") as tmpdir:
+                out_path = Path(tmpdir) / "codex_output.md"
+
+                if kind == "followup":
+                    cmd = base_cmd + [
+                        "exec",
+                        "resume",
+                        initial_sid,
+                        "--skip-git-repo-check",
+                        "--json",
+                        "-o",
+                        str(out_path),
+                        "-",
+                    ]
+                    rc, final_text, stderr_text, session_id, turn_failed, canceled, timed_out = (
+                        _run_streaming_codex(
+                            cmd, prompt_text, workspace_dir, timeout_sec, out_path, job_dir, status, start_mono
+                        )
+                    )
+                elif git_scope:
+                    scope_flags = _parse_git_scope(git_scope)
+                    review_cmd = base_cmd + [
+                        "exec",
+                        "review",
+                        "--skip-git-repo-check",
+                        "--json",
+                        "-o",
+                        str(out_path),
+                        *scope_flags,
+                        "-",
+                    ]
+                    used_subcommand = "exec review"
+                    rc, final_text, stderr_text, session_id, turn_failed, canceled, timed_out = (
+                        _run_streaming_codex(
+                            review_cmd,
+                            prompt_text,
+                            workspace_dir,
+                            timeout_sec,
+                            out_path,
+                            job_dir,
+                            status,
+                            start_mono,
+                        )
+                    )
+                    if (
+                        not canceled
+                        and not timed_out
+                        and rc != 0
+                        and not final_text
+                        and ("cannot be used with" in stderr_text or "Usage:" in stderr_text)
+                    ):
+                        git_hint = (
+                            f"\n\nRun read-only git inspection commands (`git status`, `git diff`, etc.) "
+                            f"for scope `{git_scope}` before writing your review."
+                        )
+                        exec_cmd = base_cmd + [
+                            "exec",
+                            "--skip-git-repo-check",
+                            "--color",
+                            "never",
+                            "--json",
+                            "-o",
+                            str(out_path),
+                            "-",
+                        ]
+                        used_subcommand = "exec (git fallback)"
+                        rc, final_text, stderr_text, session_id, turn_failed, canceled, timed_out = (
+                            _run_streaming_codex(
+                                exec_cmd,
+                                prompt_text + git_hint,
+                                workspace_dir,
+                                timeout_sec,
+                                out_path,
+                                job_dir,
+                                status,
+                                start_mono,
+                            )
+                        )
+                else:
+                    exec_cmd = base_cmd + [
+                        "exec",
+                        "--skip-git-repo-check",
+                        "--color",
+                        "never",
+                        "--json",
+                        "-o",
+                        str(out_path),
+                        "-",
+                    ]
+                    rc, final_text, stderr_text, session_id, turn_failed, canceled, timed_out = (
+                        _run_streaming_codex(
+                            exec_cmd,
+                            prompt_text,
+                            workspace_dir,
+                            timeout_sec,
+                            out_path,
+                            job_dir,
+                            status,
+                            start_mono,
+                        )
+                    )
+    except Exception as exc:  # noqa: BLE001
+        fatal_exc = str(exc)
+    finally:
+        elapsed = round(time.monotonic() - start_mono, 2)
+        if session_id:
+            _record_session_workspace(session_id, workspace_dir)
+
+        if canceled or (job_dir / "cancel.flag").exists():
+            final_state = "canceled"
+        elif fatal_exc or timed_out or rc != 0 or turn_failed:
+            final_state = "failed"
+        else:
+            final_state = "completed"
+
+        is_error = final_state != "completed"
+        title = "### Codex Follow-up Verification" if kind == "followup" else "### Codex Second-Opinion Review"
+        header_lines = [
+            title,
+            f"- **job_id**: `{job_id}`",
+            f"- **state**: `{final_state}`",
+            f"- **model**: `{model}`",
+            f"- **reasoning_effort**: `{effort or 'model-default'}`",
+            f"- **session_id**: `{session_id or 'unavailable'}`",
+            f"- **elapsed_sec**: `{elapsed}`",
+            f"- **command**: `{used_subcommand}`",
+        ]
+        err_msg = (
+            fatal_exc
+            or ("Timed out." if timed_out else ("Canceled." if final_state == "canceled" else stderr_text))
+        )
+        if is_error and not err_msg:
+            err_msg = f"Codex exited with code/signal {rc}."
+        if is_error and err_msg:
+            header_lines.append(f"- **error**: {err_msg}")
+
+        body = final_text or (
+            err_msg if is_error and err_msg else "(Codex produced an empty response.)"
+        )
+        report_md = f"{chr(10).join(header_lines)}\n\n---\n\n{body}\n"
+        report_path = job_dir / "report.md"
+        _atomic_write_text(report_path, report_md)
+
+        done_payload = {
+            "job_id": job_id,
+            "kind": kind,
+            "state": final_state,
+            "is_error": is_error,
+            "exit_code": rc,
+            "model": model,
+            "reasoning_effort": effort or "model-default",
+            "session_id": session_id,
+            "workspace_dir": workspace_dir,
+            "elapsed_sec": elapsed,
+            "command": used_subcommand,
+            "report_path": str(report_path),
+            "error": err_msg if is_error else None,
+        }
+        status.update(
+            {
+                "state": final_state,
+                "is_error": is_error,
+                "session_id": session_id,
+                "elapsed_sec": elapsed,
+                "heartbeat_ts": time.time(),
+                "finished_at": time.time(),
+            }
+        )
+        _atomic_write_json(job_dir / "status.json", status)
+        _atomic_write_json(job_dir / "done.json", done_payload)
+
+    return 1 if is_error else 0
+
+
+def _format_launch_response(status: dict[str, Any]) -> dict[str, Any]:
+    """Format immediate background-job launch response for MCP callers."""
+    timeout_val = int(status.get("timeout_sec") or 0)
+    summary = {
+        "job_id": status["job_id"],
+        "kind": status["kind"],
+        "state": status["state"],
+        "model": status["model"],
+        "reasoning_effort": status["reasoning_effort"],
+        "timeout": "unlimited" if timeout_val == 0 else f"{timeout_val}s",
+        "workspace_dir": status.get("workspace_dir"),
+        "report_path": status["report_path"],
+        "wait_command": status["wait_command"],
+        "next_action": (
+            f"Run `{status['wait_command']}` via run_command (BypassSandbox: false, WaitMsBeforeAsync: 5000) "
+            "and end your turn to sleep with zero polling until Codex finishes and wakes you up."
+        ),
+    }
+    return {
+        "content": [{"type": "text", "text": json.dumps(summary, indent=2, ensure_ascii=False)}],
+        "isError": False,
+    }
+
+
 def handle_codex_review(args: dict[str, Any]) -> dict[str, Any]:
-    """Run a non-interactive read-only Codex review and return structured findings."""
+    """Validate inputs and launch a detached unlimited-duration background Codex review."""
     content = str(args.get("content") or "").strip()
     git_scope_raw = args.get("git_scope")
     git_scope = str(git_scope_raw).strip() if isinstance(git_scope_raw, str) and git_scope_raw.strip() else None
 
     if not content and not git_scope:
         raise ValueError("Provide non-empty 'content' or 'git_scope'.")
+    if git_scope:
+        _parse_git_scope(git_scope)
 
     workspace_dir = _validate_workspace(args.get("workspace_dir"))
     focus_files = args.get("focus_files") if isinstance(args.get("focus_files"), list) else None
@@ -374,95 +976,25 @@ def handle_codex_review(args: dict[str, Any]) -> dict[str, Any]:
         extra_instructions=extra_instructions,
         git_scope=git_scope,
     )
-    base_cmd = build_base_cmd(codex_bin, model, effort, workspace_dir, extra_args)
 
-    start = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="codex-reviewer-") as tmpdir:
-        out_path = Path(tmpdir) / "review_output.md"
-        used_subcommand = "exec"
-
-        if git_scope:
-            scope_flags = _parse_git_scope(git_scope)
-            review_cmd = base_cmd + [
-                "exec",
-                "review",
-                "--skip-git-repo-check",
-                "--json",
-                "-o",
-                str(out_path),
-                *scope_flags,
-                "-",
-            ]
-            used_subcommand = "exec review"
-            rc, final_text, stderr_text, session_id, _ = run_codex_subprocess(
-                review_cmd, full_prompt, workspace_dir, timeout_sec, out_path
-            )
-            # Fall back to standard read-only `exec` if `exec review` rejects scope+prompt flags.
-            if rc != 0 and not final_text and (
-                "cannot be used with" in stderr_text or "Usage:" in stderr_text
-            ):
-                git_hint = (
-                    f"\n\nRun read-only git inspection commands (`git status`, `git diff`, etc.) "
-                    f"for scope `{git_scope}` before writing your review."
-                )
-                exec_cmd = base_cmd + [
-                    "exec",
-                    "--skip-git-repo-check",
-                    "--color",
-                    "never",
-                    "--json",
-                    "-o",
-                    str(out_path),
-                    "-",
-                ]
-                used_subcommand = "exec (git fallback)"
-                rc, final_text, stderr_text, session_id, _ = run_codex_subprocess(
-                    exec_cmd, full_prompt + git_hint, workspace_dir, timeout_sec, out_path
-                )
-        else:
-            exec_cmd = base_cmd + [
-                "exec",
-                "--skip-git-repo-check",
-                "--color",
-                "never",
-                "--json",
-                "-o",
-                str(out_path),
-                "-",
-            ]
-            rc, final_text, stderr_text, session_id, _ = run_codex_subprocess(
-                exec_cmd, full_prompt, workspace_dir, timeout_sec, out_path
-            )
-
-    elapsed = round(time.monotonic() - start, 2)
-    if rc != 0 and not final_text:
-        raise RuntimeError(
-            f"Codex `{used_subcommand}` failed (exit {rc}, model={model}, effort={effort or 'default'}):\n"
-            f"{stderr_text or '(no stderr output)'}"
-        )
-
-    header = "\n".join(
-        [
-            "### Codex Second-Opinion Review",
-            f"- **model**: `{model}`",
-            f"- **reasoning_effort**: `{effort or 'model-default'}`",
-            f"- **session_id**: `{session_id or 'unavailable'}`",
-            f"- **elapsed_sec**: `{elapsed}`",
-            f"- **command**: `{used_subcommand}`",
-        ]
+    status = start_background_job(
+        {
+            "kind": "review",
+            "model": model,
+            "effort": effort,
+            "codex_bin": codex_bin,
+            "extra_args": extra_args,
+            "timeout_sec": timeout_sec,
+            "workspace_dir": workspace_dir,
+            "git_scope": git_scope,
+            "prompt": full_prompt,
+        }
     )
-    if rc != 0 and stderr_text:
-        header += f"\n- **warning**: Codex exited with code {rc}: {stderr_text}"
-
-    body = final_text or "(Codex produced an empty response.)"
-    return {
-        "content": [{"type": "text", "text": f"{header}\n\n---\n\n{body}"}],
-        "isError": False,
-    }
+    return _format_launch_response(status)
 
 
 def handle_codex_followup(args: dict[str, Any]) -> dict[str, Any]:
-    """Resume an existing Codex review session to ask a targeted clarification question."""
+    """Validate inputs and launch a detached background Codex session follow-up."""
     session_id = str(args.get("session_id") or "").strip()
     question = str(args.get("question") or "").strip()
     if not session_id:
@@ -470,22 +1002,18 @@ def handle_codex_followup(args: dict[str, Any]) -> dict[str, Any]:
     if not question:
         raise ValueError("'question' is required.")
 
-    workspace_dir = _validate_workspace(args.get("workspace_dir"))
+    raw_ws = args.get("workspace_dir")
+    if isinstance(raw_ws, str) and raw_ws.strip():
+        workspace_dir = _validate_workspace(raw_ws)
+    else:
+        saved_ws = _lookup_session_workspace(session_id)
+        workspace_dir = _validate_workspace(saved_ws) if saved_ws else None
+
     config = load_config()
     codex_bin = resolve_codex_bin(config)
     model, effort = resolve_model_and_effort(args.get("model"), args.get("reasoning_effort"), config)
     timeout_sec = _resolve_timeout_sec(args, config)
     extra_args = list(config.get("extra_codex_args") or [])
-
-    base_cmd = build_base_cmd(codex_bin, model, effort, workspace_dir, extra_args)
-    resume_cmd = base_cmd + [
-        "exec",
-        "resume",
-        session_id,
-        "--skip-git-repo-check",
-        "--json",
-        "-o",
-    ]
 
     followup_prompt = (
         "Follow-up verification from the primary investigator. Answer concisely with concrete "
@@ -493,36 +1021,109 @@ def handle_codex_followup(args: dict[str, Any]) -> dict[str, Any]:
         f"{question}"
     )
 
-    start = time.monotonic()
-    with tempfile.TemporaryDirectory(prefix="codex-followup-") as tmpdir:
-        out_path = Path(tmpdir) / "followup_output.md"
-        rc, final_text, stderr_text, resumed_id, _ = run_codex_subprocess(
-            resume_cmd + [str(out_path), "-"],
-            followup_prompt,
-            workspace_dir,
-            timeout_sec,
-            out_path,
-        )
-
-    elapsed = round(time.monotonic() - start, 2)
-    if rc != 0 and not final_text:
-        raise RuntimeError(
-            f"Codex `exec resume` failed (exit {rc}, session_id={session_id}):\n"
-            f"{stderr_text or '(no stderr output)'}"
-        )
-
-    header = "\n".join(
-        [
-            "### Codex Follow-up Verification",
-            f"- **session_id**: `{resumed_id or session_id}`",
-            f"- **model**: `{model}`",
-            f"- **reasoning_effort**: `{effort or 'model-default'}`",
-            f"- **elapsed_sec**: `{elapsed}`",
-        ]
+    status = start_background_job(
+        {
+            "kind": "followup",
+            "session_id": session_id,
+            "model": model,
+            "effort": effort,
+            "codex_bin": codex_bin,
+            "extra_args": extra_args,
+            "timeout_sec": timeout_sec,
+            "workspace_dir": workspace_dir,
+            "prompt": followup_prompt,
+        }
     )
-    body = final_text or "(Codex produced an empty follow-up response.)"
+    return _format_launch_response(status)
+
+
+def handle_codex_review_status(args: dict[str, Any]) -> dict[str, Any]:
+    """Query, retrieve, cancel, or list background Codex review jobs."""
+    action = str(args.get("action") or "get").strip().lower()
+    if action not in ("get", "cancel", "list"):
+        raise ValueError("Invalid action. Must be 'get', 'cancel', or 'list'.")
+
+    if action == "list":
+        jobs: list[dict[str, Any]] = []
+        if JOBS_DIR.exists():
+            for entry in JOBS_DIR.iterdir():
+                if not entry.is_dir():
+                    continue
+                done_path = entry / "done.json"
+                status_path = entry / "status.json"
+                try:
+                    if done_path.exists():
+                        data = json.loads(done_path.read_text(encoding="utf-8"))
+                    elif status_path.exists():
+                        data = json.loads(status_path.read_text(encoding="utf-8"))
+                    else:
+                        continue
+                    if isinstance(data, dict):
+                        jobs.append(data)
+                except Exception:  # noqa: BLE001
+                    continue
+        jobs.sort(key=lambda x: float(x.get("started_at") or 0.0), reverse=True)
+        return {
+            "content": [{"type": "text", "text": json.dumps({"jobs": jobs[:20]}, indent=2, ensure_ascii=False)}],
+            "isError": False,
+        }
+
+    job_id = str(args.get("job_id") or "").strip()
+    if not job_id:
+        raise ValueError(f"'job_id' is required for action='{action}'.")
+    job_dir = _validate_job_id(job_id)
+
+    if action == "cancel":
+        done_path = job_dir / "done.json"
+        if done_path.exists():
+            done = json.loads(done_path.read_text(encoding="utf-8"))
+            return {
+                "content": [{"type": "text", "text": json.dumps({"note": "Job already finished.", **done}, indent=2, ensure_ascii=False)}],
+                "isError": False,
+            }
+        (job_dir / "cancel.flag").write_text("cancel\n", encoding="utf-8")
+        status_path = job_dir / "status.json"
+        status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {}
+        # Terminate only Codex so the worker cleanly finishes its finally block and writes done.json.
+        _terminate_process_group(status.get("codex_pid"))
+        status["state"] = "canceling"
+        return {
+            "content": [{"type": "text", "text": json.dumps(status, indent=2, ensure_ascii=False)}],
+            "isError": False,
+        }
+
+    # action == "get"
+    done_path = job_dir / "done.json"
+    if done_path.exists():
+        done = json.loads(done_path.read_text(encoding="utf-8"))
+        report_path = job_dir / "report.md"
+        report_text = report_path.read_text(encoding="utf-8").strip() if report_path.exists() else ""
+        return {
+            "content": [{"type": "text", "text": report_text or json.dumps(done, indent=2, ensure_ascii=False)}],
+            "isError": bool(done.get("is_error")),
+        }
+
+    status_path = job_dir / "status.json"
+    status = json.loads(status_path.read_text(encoding="utf-8")) if status_path.exists() else {"job_id": job_id}
+    if _pid_definitely_dead(status.get("worker_pid")) and not done_path.exists():
+        log_path = job_dir / "worker.log"
+        log_tail = ""
+        if log_path.exists():
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            log_tail = "\n".join(lines[-25:])
+        status["state"] = "dead"
+        status["error"] = "Worker process exited unexpectedly before writing done.json."
+        if log_tail:
+            status["worker_log_tail"] = log_tail
+        return {
+            "content": [{"type": "text", "text": json.dumps(status, indent=2, ensure_ascii=False)}],
+            "isError": True,
+        }
+
+    started_at = float(status.get("started_at") or time.time())
+    status["elapsed_sec"] = round(time.time() - started_at, 2)
     return {
-        "content": [{"type": "text", "text": f"{header}\n\n---\n\n{body}"}],
+        "content": [{"type": "text", "text": json.dumps(status, indent=2, ensure_ascii=False)}],
         "isError": False,
     }
 
@@ -548,36 +1149,39 @@ def handle_codex_review_config(args: dict[str, Any]) -> dict[str, Any]:
     if action not in ("get", "set", "reset"):
         raise ValueError("Invalid action. Must be 'get', 'set', or 'reset'.")
 
+    def _mutate(cfg: dict[str, Any]) -> dict[str, Any]:
+        if args.get("model") is not None or args.get("reasoning_effort") is not None:
+            resolved_model, resolved_effort = resolve_model_and_effort(
+                args.get("model"),
+                args.get("reasoning_effort"),
+                cfg,
+            )
+            if args.get("model") is not None:
+                cfg["model"] = resolved_model
+            if args.get("reasoning_effort") is not None or (
+                args.get("model") is not None and resolved_effort != cfg.get("reasoning_effort")
+            ):
+                cfg["reasoning_effort"] = resolved_effort
+        if args.get("timeout_sec") is not None:
+            timeout_val = int(args["timeout_sec"])
+            if timeout_val < 0:
+                raise ValueError("'timeout_sec' must be >= 0 (0 means unlimited).")
+            cfg["timeout_sec"] = timeout_val
+        if args.get("codex_bin") is not None:
+            cfg["codex_bin"] = str(args["codex_bin"]).strip()
+        if args.get("extra_codex_args") is not None:
+            if not isinstance(args["extra_codex_args"], list):
+                raise ValueError("'extra_codex_args' must be an array of strings.")
+            cfg["extra_codex_args"] = [str(x) for x in args["extra_codex_args"]]
+        return cfg
+
     if action == "reset":
         cfg = _merge_config({})
         save_config(cfg)
+    elif action == "set":
+        cfg = update_config(_mutate)
     else:
         cfg = load_config()
-        if action == "set":
-            if args.get("model") is not None or args.get("reasoning_effort") is not None:
-                resolved_model, resolved_effort = resolve_model_and_effort(
-                    args.get("model"),
-                    args.get("reasoning_effort"),
-                    cfg,
-                )
-                if args.get("model") is not None:
-                    cfg["model"] = resolved_model
-                if args.get("reasoning_effort") is not None or (
-                    args.get("model") is not None and resolved_effort != cfg.get("reasoning_effort")
-                ):
-                    cfg["reasoning_effort"] = resolved_effort
-            if args.get("timeout_sec") is not None:
-                timeout_val = int(args["timeout_sec"])
-                if timeout_val < 0:
-                    raise ValueError("'timeout_sec' must be >= 0 (0 means unlimited).")
-                cfg["timeout_sec"] = timeout_val
-            if args.get("codex_bin") is not None:
-                cfg["codex_bin"] = str(args["codex_bin"]).strip()
-            if args.get("extra_codex_args") is not None:
-                if not isinstance(args["extra_codex_args"], list):
-                    raise ValueError("'extra_codex_args' must be an array of strings.")
-                cfg["extra_codex_args"] = [str(x) for x in args["extra_codex_args"]]
-            save_config(cfg)
 
     resolved_model, resolved_effort = resolve_model_and_effort(None, None, cfg)
     codex_version = _detect_codex_version(str(cfg.get("codex_bin") or "codex"))
@@ -585,6 +1189,7 @@ def handle_codex_review_config(args: dict[str, Any]) -> dict[str, Any]:
     resolved_timeout: str | int = "unlimited" if (raw_timeout is None or int(raw_timeout) == 0) else int(raw_timeout)
     payload = {
         "config_path": str(CONFIG_PATH),
+        "jobs_dir": str(JOBS_DIR),
         "codex_version": codex_version,
         "resolved_model": resolved_model,
         "resolved_reasoning_effort": resolved_effort or "model-default",
@@ -601,9 +1206,10 @@ TOOLS_SPEC = [
     {
         "name": "codex_review",
         "description": (
-            "Run a strictly read-only Codex second-opinion review on implementation plans, "
-            "scientific methods/conclusions, code, or any combination thereof using a unified "
-            "anti-nitpick prompt (default: gpt-6.1-sol with high reasoning effort)."
+            "Launch a strictly read-only, unlimited-duration background Codex second-opinion review on "
+            "plans, scientific methods/conclusions, code, or any combination thereof. Returns job_id "
+            "immediately; run `codex-review-wait <job_id>` via run_command (WaitMsBeforeAsync=5000) "
+            "and end your turn to sleep until automatic wakeup."
         ),
         "inputSchema": {
             "type": "object",
@@ -641,7 +1247,7 @@ TOOLS_SPEC = [
                 },
                 "timeout_sec": {
                     "type": "integer",
-                    "description": "Optional one-off subprocess timeout in seconds (0 = unlimited).",
+                    "description": "Optional one-off timeout in seconds (0 = unlimited, default).",
                 },
             },
         },
@@ -649,8 +1255,8 @@ TOOLS_SPEC = [
     {
         "name": "codex_followup",
         "description": (
-            "Resume a prior Codex review session by session_id to challenge or clarify a specific "
-            "finding before deciding whether to adopt or discard it."
+            "Launch a detached background follow-up question against a prior Codex review session_id. "
+            "Returns job_id immediately; wait via `codex-review-wait <job_id>`."
         ),
         "inputSchema": {
             "type": "object",
@@ -659,7 +1265,7 @@ TOOLS_SPEC = [
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "Session ID returned by a previous codex_review call.",
+                    "description": "Session ID returned by a previous codex_review job.",
                 },
                 "question": {
                     "type": "string",
@@ -667,7 +1273,7 @@ TOOLS_SPEC = [
                 },
                 "workspace_dir": {
                     "type": "string",
-                    "description": "Optional workspace directory path.",
+                    "description": "Optional workspace directory path (auto-restores original session workspace if omitted).",
                 },
                 "model": {
                     "type": "string",
@@ -679,7 +1285,30 @@ TOOLS_SPEC = [
                 },
                 "timeout_sec": {
                     "type": "integer",
-                    "description": "Optional one-off subprocess timeout in seconds (0 = unlimited).",
+                    "description": "Optional one-off timeout in seconds (0 = unlimited, default).",
+                },
+            },
+        },
+    },
+    {
+        "name": "codex_review_status",
+        "description": (
+            "Get final report/live status of a background Codex job, cancel a running job, or list recent jobs. "
+            "Do NOT poll this in a loop—use `codex-review-wait <job_id>` for automatic wakeup."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["action"],
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["get", "cancel", "list"],
+                    "description": "'get' job status/report, 'cancel' a running job, or 'list' recent jobs.",
+                },
+                "job_id": {
+                    "type": "string",
+                    "description": "Job ID returned by codex_review or codex_followup (required for 'get' and 'cancel').",
                 },
             },
         },
@@ -710,7 +1339,7 @@ TOOLS_SPEC = [
                 },
                 "timeout_sec": {
                     "type": "integer",
-                    "description": "Subprocess timeout in seconds (0 = unlimited, no time limit).",
+                    "description": "Background worker timeout in seconds (0 = unlimited, no time limit).",
                 },
                 "codex_bin": {
                     "type": "string",
@@ -729,21 +1358,22 @@ TOOLS_SPEC = [
 TOOL_HANDLERS = {
     "codex_review": handle_codex_review,
     "codex_followup": handle_codex_followup,
+    "codex_review_status": handle_codex_review_status,
     "codex_review_config": handle_codex_review_config,
 }
 
 
-def read_rpc_message() -> tuple[dict[str, Any] | None, str]:
+def read_rpc_message() -> tuple[Any, str]:
     """Read one JSON-RPC message supporting both JSONL and Content-Length framing."""
     stream = sys.stdin.buffer
     while True:
         line = stream.readline()
         if not line:
-            return None, "jsonl"
+            return _EOF, "jsonl"
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.lower().startswith(b"content-length:"):
+        if not stripped.startswith((b"{", b"[")) and b":" in stripped:
             headers: dict[str, str] = {}
             header_line = line
             while header_line and header_line.strip():
@@ -752,8 +1382,12 @@ def read_rpc_message() -> tuple[dict[str, Any] | None, str]:
                     k, v = decoded.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
                 header_line = stream.readline()
-            length = int(headers.get("content-length", "0"))
+            if "content-length" not in headers:
+                raise ValueError("Missing Content-Length header in framed RPC message.")
+            length = int(headers["content-length"])
             body = stream.read(length)
+            if len(body) < length:
+                return _EOF, "content-length"
             return json.loads(body.decode("utf-8")), "content-length"
         return json.loads(stripped.decode("utf-8")), "jsonl"
 
@@ -770,19 +1404,36 @@ def write_rpc_message(payload: dict[str, Any], framing: str) -> None:
     out.flush()
 
 
-def dispatch_request(msg: dict[str, Any]) -> dict[str, Any] | None:
+def dispatch_request(msg: Any) -> dict[str, Any] | None:
     """Route a single MCP JSON-RPC request and return a response object (None for notifications)."""
+    if not isinstance(msg, dict):
+        return {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {"code": -32600, "message": "Invalid Request: expected JSON object."},
+        }
+
     req_id = msg.get("id")
     method = msg.get("method", "")
-    params = msg.get("params") or {}
+    raw_params = msg.get("params")
+    if raw_params is None:
+        params: dict[str, Any] = {}
+    elif isinstance(raw_params, dict):
+        params = raw_params
+    else:
+        return None if req_id is None else {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32602, "message": "Invalid params: expected JSON object."},
+        }
 
-    # Notifications have no `id` and must not emit a response.
     if req_id is None:
         return None
 
     try:
         if method == "initialize":
-            proto = params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION
+            req_proto = str(params.get("protocolVersion") or "").strip()
+            proto = req_proto if req_proto in SUPPORTED_PROTOCOL_VERSIONS else DEFAULT_PROTOCOL_VERSION
             result = {
                 "protocolVersion": proto,
                 "capabilities": {"tools": {"listChanged": False}},
@@ -799,7 +1450,15 @@ def dispatch_request(msg: dict[str, Any]) -> dict[str, Any] | None:
 
         if method == "tools/call":
             tool_name = params.get("name", "")
-            tool_args = params.get("arguments") or {}
+            tool_args = params.get("arguments")
+            if tool_args is None:
+                tool_args = {}
+            elif not isinstance(tool_args, dict):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {"code": -32602, "message": "Invalid tool arguments: expected JSON object."},
+                }
             handler = TOOL_HANDLERS.get(tool_name)
             if handler is None:
                 return {
@@ -830,7 +1489,10 @@ def dispatch_request(msg: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> int:
-    """Run the stdio JSON-RPC loop."""
+    """Run either detached background worker mode or stdio MCP JSON-RPC loop."""
+    if len(sys.argv) == 3 and sys.argv[1] == "--worker":
+        return run_worker_main(sys.argv[2])
+
     active_framing = "jsonl"
     while True:
         try:
@@ -847,7 +1509,7 @@ def main() -> int:
             )
             continue
 
-        if msg is None:
+        if msg is _EOF:
             return 0
         active_framing = framing
         response = dispatch_request(msg)

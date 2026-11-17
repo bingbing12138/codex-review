@@ -14,6 +14,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
 CONFIG_PATH = Path(
     os.environ.get(
         "CODEX_REVIEWER_CONFIG",
@@ -53,7 +58,13 @@ def merge_config(raw: dict[str, Any]) -> dict[str, Any]:
         for k, v in raw["model_aliases"].items():
             if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
                 aliases[k.strip()] = v.strip()
-    for key in ("model", "reasoning_effort", "codex_bin", "timeout_sec", "extra_codex_args"):
+    for key in (
+        "model",
+        "reasoning_effort",
+        "codex_bin",
+        "timeout_sec",
+        "extra_codex_args",
+    ):
         if key in raw and raw[key] is not None:
             merged[key] = raw[key]
     merged["model_aliases"] = aliases
@@ -68,7 +79,7 @@ def load_config() -> dict[str, Any]:
     return merge_config(data if isinstance(data, dict) else {})
 
 
-def save_config(cfg: dict[str, Any]) -> None:
+def _atomic_write(cfg: dict[str, Any]) -> None:
     """Atomically write updated config to CONFIG_PATH."""
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=".config-", suffix=".json", dir=str(CONFIG_PATH.parent))
@@ -81,6 +92,35 @@ def save_config(cfg: dict[str, Any]) -> None:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
         raise
+
+
+def save_config(cfg: dict[str, Any]) -> None:
+    """Atomically write updated config under the shared advisory lock."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH.with_suffix(".lock"), "a+", encoding="utf-8") as lock_fh:
+        if fcntl is not None:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            _atomic_write(cfg)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
+def update_config(mutator: Any) -> dict[str, Any]:
+    """Read, mutate, and write config under a single exclusive lock."""
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH.with_suffix(".lock"), "a+", encoding="utf-8") as lock_fh:
+        if fcntl is not None:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        try:
+            cfg = load_config()
+            updated = mutator(cfg)
+            _atomic_write(updated)
+            return updated
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 def resolve_model_and_effort(
@@ -197,30 +237,32 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "set":
-        cfg = load_config()
-        raw_model = args.flag_model if args.flag_model is not None else args.positional_model
-        raw_effort = args.flag_effort if args.flag_effort is not None else args.positional_effort
-        resolved_model, resolved_effort = resolve_model_and_effort(raw_model, raw_effort, cfg)
+        if args.timeout is not None and args.timeout < 0:
+            print("Error: --timeout must be >= 0 (0 = unlimited).", file=sys.stderr)
+            return 2
 
-        if resolved_model is not None:
-            cfg["model"] = resolved_model
-        if resolved_effort is not None:
-            cfg["reasoning_effort"] = resolved_effort
-        if args.timeout is not None:
-            if args.timeout < 0:
-                print("Error: --timeout must be >= 0 (0 = unlimited).", file=sys.stderr)
-                return 2
-            cfg["timeout_sec"] = args.timeout
-        if args.codex_bin is not None:
-            cfg["codex_bin"] = args.codex_bin.strip()
-        if args.clear_args:
-            cfg["extra_codex_args"] = []
-        if args.add_arg:
-            existing = list(cfg.get("extra_codex_args") or [])
-            existing.extend(args.add_arg)
-            cfg["extra_codex_args"] = existing
+        def _mutate(cfg: dict[str, Any]) -> dict[str, Any]:
+            raw_model = args.flag_model if args.flag_model is not None else args.positional_model
+            raw_effort = args.flag_effort if args.flag_effort is not None else args.positional_effort
+            resolved_model, resolved_effort = resolve_model_and_effort(raw_model, raw_effort, cfg)
 
-        save_config(cfg)
+            if resolved_model is not None:
+                cfg["model"] = resolved_model
+            if resolved_effort is not None:
+                cfg["reasoning_effort"] = resolved_effort
+            if args.timeout is not None:
+                cfg["timeout_sec"] = args.timeout
+            if args.codex_bin is not None:
+                cfg["codex_bin"] = args.codex_bin.strip()
+            if args.clear_args:
+                cfg["extra_codex_args"] = []
+            if args.add_arg:
+                existing = list(cfg.get("extra_codex_args") or [])
+                existing.extend(args.add_arg)
+                cfg["extra_codex_args"] = existing
+            return cfg
+
+        cfg = update_config(_mutate)
         print_status(cfg)
         return 0
 

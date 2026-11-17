@@ -16,6 +16,7 @@
    - Mismatch between stated logical plan/methodology and actual implementation (code-math or plan-code drift).
    - Scientific conclusions that are factually unsupported or contradicted by the underlying data or logic.
    - When verified, adopt the correction immediately, update the plan/code/conclusion, and report the fix clearly.
+   - If a substantive risk cannot yet be verified against local evidence, report it explicitly as **Unresolved / Needs Verification** rather than silently dropping or marking it cleared.
 2. **Filter & Ignore (Non-Fundamental / Tone Policing)**:
    - Critiques that wording is "too strong", "too absolute", or lacks rhetorical hedging/caveats when the underlying math, code, data, and logic are correct.
    - Purely stylistic prose edits, subjective naming preferences, or speculative over-engineering outside task scope.

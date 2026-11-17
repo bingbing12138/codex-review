@@ -19,11 +19,12 @@ if ! command -v codex >/dev/null 2>&1; then
   echo "Warning: 'codex' not found in PATH. Install Codex CLI and run 'codex login' before reviewing." >&2
 fi
 
-echo "[2/5] Installing codex-review-config and codex-review-run CLIs to ${BIN_DIR}/..."
+echo "[2/5] Installing codex-review-{config,wait,run} CLIs to ${BIN_DIR}/..."
 mkdir -p "${BIN_DIR}"
 cp "${SCRIPT_DIR}/bin/codex-review-config" "${BIN_DIR}/codex-review-config"
+cp "${SCRIPT_DIR}/bin/codex-review-wait" "${BIN_DIR}/codex-review-wait"
 cp "${SCRIPT_DIR}/bin/codex-review-run" "${BIN_DIR}/codex-review-run"
-chmod +x "${BIN_DIR}/codex-review-config" "${BIN_DIR}/codex-review-run"
+chmod +x "${BIN_DIR}/codex-review-config" "${BIN_DIR}/codex-review-wait" "${BIN_DIR}/codex-review-run"
 
 echo "[3/5] Initializing default runtime config (preserving existing if present)..."
 mkdir -p "${CONFIG_DIR}"
