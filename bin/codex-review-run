@@ -63,12 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Designed for AGY background tasks with zero timeout limit by default."
         ),
     )
-    parser.add_argument(
-        "--mode",
-        choices=["science", "plan", "code"],
-        default="science",
-        help="Review lens (ignored when --followup is set). Default: science.",
-    )
+    parser.add_argument("--mode", help=argparse.SUPPRESS)
     parser.add_argument("--workspace", help="Absolute or relative workspace directory (-C).")
     parser.add_argument(
         "--prompt-file",
@@ -83,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--git-scope",
-        help="Git diff scope (mode=code only): uncommitted, base:<branch>, or commit:<sha>.",
+        help="Git diff scope: uncommitted, base:<branch>, or commit:<sha>.",
     )
     parser.add_argument("--extra", help="Additional review instructions.")
     parser.add_argument(
@@ -131,7 +126,6 @@ def main(argv: list[str] | None = None) -> int:
             result = codex_mcp.handle_codex_followup(payload)
         else:
             payload = {
-                "mode": args.mode,
                 "content": text_input,
             }
             if args.workspace:

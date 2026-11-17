@@ -8,7 +8,7 @@ Antigravity (AGY) plugin integrating non-interactive, read-only Codex second-opi
   - **MCP (`codex_review`, `codex_followup`, `codex_review_config`)**: Seamless zero-prompt reviews for routine checks (< 3 min).
   - **Async Background CLI (`codex-review-run`)**: Designed for deep, large-codebase reviews (30–60+ min) via AGY background tasks—zero timeout cap (`timeout_sec: 0`), zero polling/token burn while Codex thinks, automatic AGY wakeup on completion, and full report saved to disk.
 - **Read-only codebase verification**: Runs `codex -a never -s read-only exec ...` in your workspace so Codex checks real files, equations, and code-to-method alignment without modifying files.
-- **Anti-nitpick built-in templates**: Audits `science`, `plan`, and `code` modes for fundamental defects (calculation errors, data leakage, bugs, plan-code drift, unsupported conclusions) while explicitly suppressing tone-policing or hedging feedback.
+- **Unified 3-in-1 adaptive prompt**: A single `review.md` template audits plans, scientific/mathematical rigor, code logic, and code-to-science alignment without mode-switching overhead while suppressing tone-policing or hedging feedback.
 - **AGY-primary adjudication**: Bundled `rules/AGENTS.md` enforces independent verification—mandatory adoption of verified fundamental defects, automatic filtering of stylistic/tone nitpicks.
 - **Hot-reloaded model config**: Change models, reasoning effort, or timeout anytime via CLI, chat, or JSON without restarting AGY.
 
@@ -74,9 +74,7 @@ codex-reviewer/
     └── codex-review/
         ├── SKILL.md
         ├── references/prompts/
-        │   ├── science_review.md
-        │   ├── plan_review.md
-        │   └── code_review.md
+        │   └── review.md
         └── scripts/
             └── codex_mcp.py
 ```

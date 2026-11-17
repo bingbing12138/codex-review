@@ -25,8 +25,8 @@ CONFIG_PATH = Path(
     )
 )
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "references" / "prompts"
+PROMPT_FILE = PROMPTS_DIR / "review.md"
 
-VALID_MODES = ("science", "plan", "code")
 VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -174,23 +174,21 @@ def resolve_codex_bin(config: dict[str, Any]) -> str:
     )
 
 
-def load_prompt_template(mode: str) -> str:
-    """Load the built-in review prompt template for the requested mode."""
-    prompt_file = PROMPTS_DIR / f"{mode}_review.md"
-    if not prompt_file.exists():
-        raise FileNotFoundError(f"Missing prompt template: {prompt_file}")
-    return prompt_file.read_text(encoding="utf-8").strip()
+def load_prompt_template() -> str:
+    """Load the unified adaptive review prompt template."""
+    if not PROMPT_FILE.exists():
+        raise FileNotFoundError(f"Missing prompt template: {PROMPT_FILE}")
+    return PROMPT_FILE.read_text(encoding="utf-8").strip()
 
 
 def build_review_prompt(
-    mode: str,
     content: str,
     focus_files: list[str] | None,
     extra_instructions: str | None,
     git_scope: str | None,
 ) -> str:
     """Assemble a de-biased, structured review prompt for Codex."""
-    sections = [load_prompt_template(mode)]
+    sections = [load_prompt_template()]
 
     if focus_files:
         file_lines = "\n".join(f"- {p}" for p in focus_files if isinstance(p, str) and p.strip())
@@ -353,18 +351,12 @@ def _parse_git_scope(git_scope: str) -> list[str]:
 
 def handle_codex_review(args: dict[str, Any]) -> dict[str, Any]:
     """Run a non-interactive read-only Codex review and return structured findings."""
-    mode = str(args.get("mode") or "science").strip().lower()
-    if mode not in VALID_MODES:
-        raise ValueError(f"Invalid mode '{mode}'. Must be one of: {', '.join(VALID_MODES)}.")
-
     content = str(args.get("content") or "").strip()
     git_scope_raw = args.get("git_scope")
     git_scope = str(git_scope_raw).strip() if isinstance(git_scope_raw, str) and git_scope_raw.strip() else None
 
     if not content and not git_scope:
-        raise ValueError("Provide non-empty 'content' (or 'git_scope' in code mode).")
-    if git_scope and mode != "code":
-        raise ValueError("'git_scope' is only supported when mode='code'.")
+        raise ValueError("Provide non-empty 'content' or 'git_scope'.")
 
     workspace_dir = _validate_workspace(args.get("workspace_dir"))
     focus_files = args.get("focus_files") if isinstance(args.get("focus_files"), list) else None
@@ -377,7 +369,6 @@ def handle_codex_review(args: dict[str, Any]) -> dict[str, Any]:
     extra_args = list(config.get("extra_codex_args") or [])
 
     full_prompt = build_review_prompt(
-        mode=mode,
         content=content or f"Review the git changes specified by scope: {git_scope}",
         focus_files=focus_files,
         extra_instructions=extra_instructions,
@@ -453,7 +444,6 @@ def handle_codex_review(args: dict[str, Any]) -> dict[str, Any]:
     header = "\n".join(
         [
             "### Codex Second-Opinion Review",
-            f"- **mode**: `{mode}`",
             f"- **model**: `{model}`",
             f"- **reasoning_effort**: `{effort or 'model-default'}`",
             f"- **session_id**: `{session_id or 'unavailable'}`",
@@ -611,23 +601,18 @@ TOOLS_SPEC = [
     {
         "name": "codex_review",
         "description": (
-            "Run a strictly read-only Codex second-opinion review against scientific methods/conclusions, "
-            "implementation plans, or code. Uses built-in anti-nitpick review prompts and hot-reloaded "
-            "model configuration (default: gpt-6.1-sol with high reasoning effort)."
+            "Run a strictly read-only Codex second-opinion review on implementation plans, "
+            "scientific methods/conclusions, code, or any combination thereof using a unified "
+            "anti-nitpick prompt (default: gpt-6.1-sol with high reasoning effort)."
         ),
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["mode", "content"],
+            "required": [],
             "properties": {
-                "mode": {
-                    "type": "string",
-                    "enum": ["science", "plan", "code"],
-                    "description": "Review lens: 'science' (math/data/leakage/conclusions), 'plan' (architecture/feasibility), or 'code' (bugs/spec alignment).",
-                },
                 "content": {
                     "type": "string",
-                    "description": "Objective, de-biased summary of the plan, methodology, equations, or conclusion to audit.",
+                    "description": "Objective, de-biased summary of the plan, methodology, equations, code scope, or conclusion to audit.",
                 },
                 "workspace_dir": {
                     "type": "string",
@@ -640,7 +625,7 @@ TOOLS_SPEC = [
                 },
                 "git_scope": {
                     "type": "string",
-                    "description": "Optional git diff scope (only when mode='code'): 'uncommitted', 'base:<branch>', or 'commit:<sha>'.",
+                    "description": "Optional git diff scope: 'uncommitted', 'base:<branch>', or 'commit:<sha>'.",
                 },
                 "extra_instructions": {
                     "type": "string",
